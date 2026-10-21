@@ -1,4 +1,0 @@
-project_id,url,final,failure_stage,failure_category,failure_message,commit,num_tests,num_fixtures,loc_projeto_total,baseline_tests,baseline_failures,baseline_errors,baseline_skipped,baseline_seconds,reps_ok,reps_failed,python_version,pytest_version,codecarbon_version,freeze_sha1
-cactus-compute__needle,https://github.com/cactus-compute/needle,excluded,baseline,baseline_high_failure_rate,35 falhas + 22 erros em 257 testes (limite 5%),b4fc11b04f1852888d375c8c6dfbaca44572d014,150,16,6779,257,35,22,20,21.6,0,0,3.14.4,9.1.1,3.3.1,a27c42689477
-roboflow__supervision,https://github.com/roboflow/supervision,ready,,,,893a9b1a6d0dd141eb0324d20ae8533c35284608,1742,65,68172,6035,0,0,132,126.0,0,2,3.14.4,9.1.1,3.3.1,b379e04b0a43
-Graphify-Labs__graphify,https://github.com/Graphify-Labs/graphify,measured,,,,b90b9df7949bd04a15b40a1624af85d0a9cfdf04,5092,23,114235,8428,19,0,206,333.9,2,0,3.14.4,9.1.1,3.3.1,c2085a8646d4

@@ -24,3 +24,6 @@ energia_ws/
 # Ignorar logs da varredura
 *.log
 sweep.log
+
+energia_ws/
+ws_sweep/
