@@ -1,32 +1,39 @@
+# ==========================================
 # Ambientes Virtuais e Configurações Locais
+# ==========================================
 venv/
 .venv/
 .env
 
-# Cache do Python e Pytest
+# ==========================================
+# Cache do Python e Ferramentas de Teste
+# ==========================================
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
 
-# Áreas de trabalho do orquestrador (clones, venvs e resultados pesados)
+# ==========================================
+# Áreas de trabalho do orquestrador e saídas
+# ==========================================
 workspace/
-
-# Diretórios temporários legados
-repositorios_temp/
-results/
-
-# Ignorar diretórios de execução do orquestrador
 ws_smoke/
 ws_sweep/
 energia_ws/
+repositorios_temp/
+results/
+output/
+out/
 
-# Ignorar logs da varredura
+# ==========================================
+# Logs e Varreduras
+# ==========================================
 *.log
 sweep.log
 
-energia_ws/
-ws_sweep/
-
-energia_ws/
-ws_sweep/
+# ==========================================
+# IDEs e Ferramentas de Sistema
+# ==========================================
+.idea/
+.vscode/
+.DS_Store
