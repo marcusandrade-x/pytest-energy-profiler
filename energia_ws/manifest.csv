@@ -1,0 +1,4 @@
+project_id,url,project_name,num_tests,num_fixtures,loc_tests,loc_producao,loc_projeto_total,arquivos_tests,arquivos_producao
+cactus-compute__needle,https://github.com/cactus-compute/needle,needle,150,16,2006,4773,6779,18,23
+roboflow__supervision,https://github.com/roboflow/supervision,supervision,1742,65,40645,27527,68172,94,114
+Graphify-Labs__graphify,https://github.com/Graphify-Labs/graphify,graphify,5092,23,65089,49146,114235,302,113

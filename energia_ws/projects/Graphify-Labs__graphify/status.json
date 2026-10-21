@@ -1,0 +1,67 @@
+{
+  "project_id": "Graphify-Labs__graphify",
+  "url": "https://github.com/Graphify-Labs/graphify",
+  "final": "measured",
+  "stages": {
+    "clone": {
+      "status": "ok",
+      "at": "2026-10-20T23:46:15+00:00",
+      "seconds": 2.7
+    },
+    "install": {
+      "status": "ok",
+      "at": "2026-10-20T23:47:12+00:00",
+      "seconds": 56.7
+    },
+    "baseline": {
+      "status": "ok",
+      "at": "2026-10-20T23:52:46+00:00",
+      "seconds": 333.9
+    }
+  },
+  "install": {
+    "installer": "pip",
+    "steps": [
+      "profiler_deps",
+      "projeto",
+      "dependency-group"
+    ],
+    "freeze_sha1": "c2085a8646d4",
+    "python": "3.14.4",
+    "pytest": "9.1.1",
+    "codecarbon": "3.3.1"
+  },
+  "baseline": {
+    "exit_code": 1,
+    "seconds": 333.9,
+    "tests": 8428,
+    "failures": 19,
+    "errors": 0,
+    "skipped": 206,
+    "junit_seconds": 330.716
+  },
+  "reps": {
+    "1": {
+      "attempts": 1,
+      "exit_code": 1,
+      "seconds": 1240.8,
+      "loadavg_1m_before": 5.74,
+      "at": "2026-10-21T00:13:27+00:00",
+      "profiler_sha1": "d5e0391edfec",
+      "run_id": "938e1d68-e4a2-42e1-b8d1-4a695a05b6f7",
+      "status": "ok"
+    },
+    "2": {
+      "attempts": 1,
+      "exit_code": 1,
+      "seconds": 1113.9,
+      "loadavg_1m_before": 1.2,
+      "at": "2026-10-21T00:42:51+00:00",
+      "profiler_sha1": "d5e0391edfec",
+      "run_id": "17581da5-0eb8-4bb3-9d2a-b5a3bb1f0ea2",
+      "status": "ok"
+    }
+  },
+  "failure": null,
+  "commit": "b90b9df7949bd04a15b40a1624af85d0a9cfdf04"
+}

@@ -1,0 +1,18 @@
+# Ambientes Virtuais e Configurações Locais
+venv/
+.venv/
+.env
+
+# Cache do Python e Pytest
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Áreas de trabalho do orquestrador (clones, venvs e resultados pesados)
+workspace/
+workspace/
+
+# Diretórios temporários legados
+repositorios_temp/
+results/

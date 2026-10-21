@@ -1,0 +1,57 @@
+Metadata-Version: 2.4
+Name: tree-sitter-hcl
+Version: 1.2.0
+Summary: HCL and terraform grammar for tree-sitter
+License: Apache-2.0
+Project-URL: Homepage, https://github.com/tree-sitter-grammars/tree-sitter-hcl
+Keywords: incremental,parsing,tree-sitter,hcl
+Classifier: Intended Audience :: Developers
+Classifier: Topic :: Software Development :: Compilers
+Classifier: Topic :: Text Processing :: Linguistic
+Classifier: Typing :: Typed
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Provides-Extra: core
+Requires-Dist: tree-sitter~=0.24; extra == "core"
+Dynamic: license-file
+
+# tree-sitter-hcl
+
+tree-sitter grammar for the [HCL](https://github.com/hashicorp/hcl/blob/main/hclsyntax/spec.md) language
+
+## Try It Out
+
+Try the parser in the [playground](https://tree-sitter-grammars.github.io/tree-sitter-hcl/)
+
+## Example
+
+Highlighting `example/example.hcl`:
+
+![Highlighting Example](https://i.imgur.com/yUJ0ybK.png)
+
+## Developing
+
+It is recommended to use `nix` to fulfill all development dependencies. To activate the development environment simply run `nix-shell` in the project root.
+
+## Running Tests
+
+To run tests simply run `nix-shell --run 'tree-sitter test'`.
+
+## Compliance
+
+The directory `example/real_world_stuff` contains a corpus of hcl files that I found with the github query `language:HCL` for users `coreos`, `hashicorp`, `oracle` and `terraform-community-modules`.
+
+```bash
+tree-sitter parse --quiet --stat example/real_world_stuff/*/*
+
+Total parses: 1892; successful parses: 1892; failed parses: 0; success percentage: 100.00%
+```
+
+## Fuzzing
+
+See the [fuzzing repo for this parser](https://github.com/MichaHoffmann/tree-sitter-hcl-fuzz)
+
+## Attributions
+
+Pages were copied from https://github.com/m-novikov/tree-sitter-sql

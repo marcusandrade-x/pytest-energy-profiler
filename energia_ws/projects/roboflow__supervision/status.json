@@ -1,0 +1,65 @@
+{
+  "project_id": "roboflow__supervision",
+  "url": "https://github.com/roboflow/supervision",
+  "final": "ready",
+  "stages": {
+    "clone": {
+      "status": "ok",
+      "at": "2026-10-20T23:45:20+00:00",
+      "seconds": 6.3
+    },
+    "install": {
+      "status": "ok",
+      "at": "2026-10-20T23:46:48+00:00",
+      "seconds": 87.6
+    },
+    "baseline": {
+      "status": "ok",
+      "at": "2026-10-20T23:48:54+00:00",
+      "seconds": 126.0
+    }
+  },
+  "install": {
+    "installer": "pip",
+    "steps": [
+      "profiler_deps",
+      "projeto",
+      "dependency-group"
+    ],
+    "freeze_sha1": "b379e04b0a43",
+    "python": "3.14.4",
+    "pytest": "9.1.1",
+    "codecarbon": "3.3.1"
+  },
+  "baseline": {
+    "exit_code": 0,
+    "seconds": 126.0,
+    "tests": 6035,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 132,
+    "junit_seconds": 121.473
+  },
+  "reps": {
+    "1": {
+      "attempts": 1,
+      "exit_code": -9,
+      "seconds": 630.0,
+      "loadavg_1m_before": 5.57,
+      "at": "2026-10-21T00:24:07+00:00",
+      "profiler_sha1": "d5e0391edfec",
+      "status": "run_timeout"
+    },
+    "2": {
+      "attempts": 1,
+      "exit_code": -9,
+      "seconds": 630.0,
+      "loadavg_1m_before": 3.0,
+      "at": "2026-10-21T00:53:32+00:00",
+      "profiler_sha1": "d5e0391edfec",
+      "status": "run_timeout"
+    }
+  },
+  "failure": null,
+  "commit": "893a9b1a6d0dd141eb0324d20ae8533c35284608"
+}

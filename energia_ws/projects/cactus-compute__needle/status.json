@@ -1,0 +1,50 @@
+{
+  "project_id": "cactus-compute__needle",
+  "url": "https://github.com/cactus-compute/needle",
+  "final": "excluded",
+  "stages": {
+    "clone": {
+      "status": "ok",
+      "at": "2026-10-20T23:45:15+00:00",
+      "seconds": 0.8
+    },
+    "install": {
+      "status": "ok",
+      "at": "2026-10-20T23:45:51+00:00",
+      "seconds": 35.9
+    },
+    "baseline": {
+      "status": "failed",
+      "at": "2026-10-20T23:46:12+00:00",
+      "category": "baseline_high_failure_rate"
+    }
+  },
+  "install": {
+    "installer": "pip",
+    "steps": [
+      "profiler_deps",
+      "projeto[test]"
+    ],
+    "freeze_sha1": "a27c42689477",
+    "python": "3.14.4",
+    "pytest": "9.1.1",
+    "codecarbon": "3.3.1"
+  },
+  "baseline": {
+    "exit_code": 1,
+    "seconds": 21.6,
+    "tests": 257,
+    "failures": 35,
+    "errors": 22,
+    "skipped": 20,
+    "junit_seconds": 20.913
+  },
+  "reps": {},
+  "failure": {
+    "stage": "baseline",
+    "category": "baseline_high_failure_rate",
+    "message": "35 falhas + 22 erros em 257 testes (limite 5%)",
+    "at": "2026-10-20T23:46:12+00:00"
+  },
+  "commit": "b4fc11b04f1852888d375c8c6dfbaca44572d014"
+}

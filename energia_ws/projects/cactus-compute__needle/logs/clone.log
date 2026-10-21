@@ -1,0 +1,2 @@
+
+$ git clone --depth 1 --quiet https://github.com/cactus-compute/needle /home/marcus/Documentos/CustoEnergicoFixtures/energia_ws/projects/cactus-compute__needle/repo
