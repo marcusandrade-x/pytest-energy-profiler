@@ -11,8 +11,16 @@ __pycache__/
 
 # Áreas de trabalho do orquestrador (clones, venvs e resultados pesados)
 workspace/
-workspace/
 
 # Diretórios temporários legados
 repositorios_temp/
 results/
+
+# Ignorar diretórios de execução do orquestrador
+ws_smoke/
+ws_sweep/
+energia_ws/
+
+# Ignorar logs da varredura
+*.log
+sweep.log
