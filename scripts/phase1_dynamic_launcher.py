@@ -297,6 +297,7 @@ def clean_environment(args: argparse.Namespace, temp_root: Path) -> dict[str, st
         "PATH": f"{python.parent}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME": str(temp_root / "home"),
         "TMPDIR": str(temp_root / "tmp"),
+        "UV_PYTHON_INSTALL_DIR": str(args.python_install_dir.resolve()),
         "LANG": "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PHASE1_RUN_UID": str(args.run_uid),
@@ -346,6 +347,9 @@ def main() -> int:
     parser.add_argument("--uv-cache-dir", type=Path,
                         default=Path("/var/tmp") / f"phase1-uv-cache-{os.geteuid()}",
                         help="Cache persistente do uv fora de tmpfs; padrão: diretório por UID em /var/tmp")
+    parser.add_argument("--python-install-dir", type=Path,
+                        default=Path("/var/tmp") / f"phase1-python-{os.geteuid()}",
+                        help="Destino persistente para Pythons gerenciados pelo uv")
     parser.add_argument("--timeout-per-test", type=int, default=120)
     parser.add_argument("--clone-timeout", type=int, default=600)
     parser.add_argument("--install-timeout", type=int, default=1200,
@@ -416,6 +420,7 @@ def main() -> int:
         record: dict[str, Any] = {
             "created_at_epoch": int(time.time()),
             "sample": str(args.sample.resolve()),
+            "uv_python_install_dir": env["UV_PYTHON_INSTALL_DIR"],
             "isolation_preflight": preflight,
             "projects": [],
         }

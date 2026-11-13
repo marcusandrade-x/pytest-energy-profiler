@@ -93,10 +93,13 @@ presentes. Após instalar o projeto, instala as ferramentas de coleta; a primeir
 tentativa completa é renomeada para `.venv_ready`. Tentativas malsucedidas são
 classificadas no JSON e seus ambientes descartados. Para respeitar projetos com
 restrição de Python, o launcher usa `project.requires-python` ou
-`.python-version` antes do Python informado como fallback. Download, build e
+`.python-version` antes do Python informado como fallback. Pythons gerenciados
+ficam em `/var/tmp/phase1-python-<uid>` por padrão, separado do `HOME` temporário
+para que `.venv_ready` continue executável após o smoke. Download, build e
 instalação do `uv` ficam serializados para reduzir o pico de memória. O cache e
-os artefatos persistentes usam `/var/tmp` por padrão, evitando ocupar a RAM de
-hosts onde `/tmp` seja `tmpfs`; ambos podem ser configurados pela CLI.
+os artefatos persistentes também usam `/var/tmp` por padrão, evitando ocupar a
+RAM de hosts onde `/tmp` seja `tmpfs`; os caminhos podem ser configurados pela
+CLI.
 
 Com `.venv_ready`, executa um `--setup-plan` isolado com
 `--continue-on-collection-errors`. A saída estruturada fica em
