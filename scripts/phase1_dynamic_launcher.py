@@ -301,12 +301,17 @@ def main() -> int:
     parser.add_argument("--install-smoke-only", action="store_true",
                         help="instala somente o projeto selecionado e preserva clone/.venv_ready")
     parser.add_argument("--isolation-launcher-json")
-    parser.add_argument("--python", required=True, help="Python do ambiente dedicado com dependências de controle")
-    parser.add_argument("--run-uid", type=int, required=True)
-    parser.add_argument("--run-gid", type=int, required=True)
+    parser.add_argument("--python", default=sys.executable,
+                        help="Python base; padrão: interpretador que executa este launcher")
+    parser.add_argument("--run-uid", type=int, default=os.geteuid(),
+                        help="UID dedicado; padrão: UID efetivo atual")
+    parser.add_argument("--run-gid", type=int, default=os.getegid(),
+                        help="GID dedicado; padrão: GID efetivo atual")
     parser.add_argument("--dedicated-user", default="phase1runner",
                         help="conta Unix dedicada esperada; padrão: phase1runner")
-    parser.add_argument("--artifacts", type=Path, required=True, help="Diretório persistente gravável pelo usuário dedicado")
+    parser.add_argument("--artifacts", type=Path,
+                        default=Path(tempfile.gettempdir()) / f"phase1-artifacts-{os.geteuid()}",
+                        help="Diretório persistente gravável; padrão: diretório por UID em /tmp")
     parser.add_argument("--timeout-per-test", type=int, default=120)
     parser.add_argument("--clone-timeout", type=int, default=600)
     parser.add_argument("--install-timeout", type=int, default=1200,
