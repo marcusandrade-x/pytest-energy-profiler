@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -148,8 +149,30 @@ def remove_ready_venv(repo: Path, ready: Path) -> None:
         shutil.rmtree(ready)
 
 
+def project_python_request(repo: Path, fallback: str) -> str:
+    """Prefer the project's declared Python range over the host interpreter."""
+    pyproject = repo / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return fallback
+        requirement = data.get("project", {}).get("requires-python")
+        if isinstance(requirement, str) and requirement.strip():
+            return requirement.strip()
+    version_file = repo / ".python-version"
+    if version_file.is_file():
+        try:
+            request = version_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            request = ""
+        if request:
+            return request
+    return fallback
+
+
 def install_project_dependencies(
-    repo: Path, *, project_id: str, python: Path, uv: str,
+    repo: Path, *, project_id: str, python: str, uv: str,
     base_env: dict[str, str], timeout: int, cache_root: Path,
 ) -> dict[str, Any]:
     """Try each install recipe in a fresh venv and promote the first success."""
@@ -160,6 +183,8 @@ def install_project_dependencies(
         return result
 
     ready = repo / ".venv_ready"
+    python_request = project_python_request(repo, python)
+    result["python_request"] = python_request
     for index, (strategy_name, install_args) in enumerate(strategies, start=1):
         attempt = repo / f".venv_attempt_{index}"
         attempt_python = attempt / "bin" / "python"
@@ -169,9 +194,13 @@ def install_project_dependencies(
         cache = cache_root / f"{project_id}-{index}"
         cache.mkdir(parents=True, exist_ok=True)
         env["UV_CACHE_DIR"] = str(cache)
+        # Keep peak RAM use predictable for large binary wheels and source builds.
+        env["UV_CONCURRENT_DOWNLOADS"] = "1"
+        env["UV_CONCURRENT_BUILDS"] = "1"
+        env["UV_CONCURRENT_INSTALLS"] = "1"
 
-        create = run([uv, "venv", "--python", str(python), str(attempt)],
-                     cwd=repo, env=env, timeout=120)
+        create = run([uv, "venv", "--python", python_request, str(attempt)],
+                     cwd=repo, env=env, timeout=timeout)
         attempt_record["venv_creation"] = create
         if create["returncode"] != 0 or create["timed_out"] or not attempt_python.is_file():
             attempt_record["category"] = "venv_creation_error" if not create["timed_out"] else "timeout"
@@ -312,8 +341,11 @@ def main() -> int:
     parser.add_argument("--dedicated-user", default="phase1runner",
                         help="conta Unix dedicada esperada; padrão: phase1runner")
     parser.add_argument("--artifacts", type=Path,
-                        default=Path(tempfile.gettempdir()) / f"phase1-artifacts-{os.geteuid()}",
-                        help="Diretório persistente gravável; padrão: diretório por UID em /tmp")
+                        default=Path("/var/tmp") / f"phase1-artifacts-{os.geteuid()}",
+                        help="Diretório persistente gravável; padrão: diretório por UID em /var/tmp")
+    parser.add_argument("--uv-cache-dir", type=Path,
+                        default=Path("/var/tmp") / f"phase1-uv-cache-{os.geteuid()}",
+                        help="Cache persistente do uv fora de tmpfs; padrão: diretório por UID em /var/tmp")
     parser.add_argument("--timeout-per-test", type=int, default=120)
     parser.add_argument("--clone-timeout", type=int, default=600)
     parser.add_argument("--install-timeout", type=int, default=1200,
@@ -453,11 +485,12 @@ def main() -> int:
             installation = install_project_dependencies(
                 repo,
                 project_id=pid,
-                python=Path(args.python).resolve(),
+                python=args.python,
                 uv=uv,
                 base_env=env,
                 timeout=args.install_timeout,
-                cache_root=uv_cache_root,
+                cache_root=(args.uv_cache_dir.resolve()
+                            if args.install_smoke_only else uv_cache_root),
             )
             project_record["dependency_installation"] = installation
             if not installation["ready"]:
