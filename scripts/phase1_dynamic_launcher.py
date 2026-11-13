@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed pilot readiness and isolated collection smoke check.
+"""Fail-closed pilot readiness and dependency-installation smoke check.
 
 This script is deliberately not the full pilot runner. It validates the exact
 isolation launcher with ``phase1_runner.py`` before cloning or executing any
@@ -14,6 +14,7 @@ import csv
 import grp
 import json
 import os
+import pwd
 import re
 import signal
 import shutil
@@ -135,6 +136,16 @@ def remove_attempt_venv(repo: Path, attempt: Path) -> None:
         shutil.rmtree(attempt)
 
 
+def remove_ready_venv(repo: Path, ready: Path) -> None:
+    """Delete only this clone's generated promoted environment."""
+    if ready.parent.resolve() != repo.resolve() or ready.name != ".venv_ready":
+        raise ValueError(f"recusa de exclusão de ambiente pronto fora do clone: {ready}")
+    if ready.is_symlink():
+        ready.unlink()
+    elif ready.exists():
+        shutil.rmtree(ready)
+
+
 def install_project_dependencies(
     repo: Path, *, project_id: str, python: Path, uv: str,
     base_env: dict[str, str], timeout: int, cache_root: Path,
@@ -193,13 +204,24 @@ def install_project_dependencies(
             if ready.exists() or ready.is_symlink():
                 raise FileExistsError(f"ambiente pronto já existe: {ready}")
             attempt.rename(ready)
+            ready_python = ready / "bin" / "python"
+            promoted_check = run([
+                str(ready_python), "-c",
+                "import pytest, sys; print(sys.executable); print(pytest.__version__)",
+            ], cwd=repo, env=env, timeout=30)
+            attempt_record["post_promotion_check"] = promoted_check
+            if promoted_check["returncode"] != 0:
+                attempt_record["category"] = "promoted_environment_not_usable"
+                result["attempts"].append(attempt_record)
+                remove_ready_venv(repo, ready)
+                continue
             attempt_record["category"] = "success"
             result["attempts"].append(attempt_record)
             result.update({
                 "ready": True,
                 "status": "installed",
                 "successful_strategy": strategy_name,
-                "python": str(ready / "bin" / "python"),
+                "python": str(ready_python),
             })
             return result
 
@@ -276,10 +298,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", type=Path, default=SAMPLE)
     parser.add_argument("--project-id", help="ID de um projeto da amostra; padrão: primeiro")
-    parser.add_argument("--isolation-launcher-json", required=True)
+    parser.add_argument("--install-smoke-only", action="store_true",
+                        help="instala somente o projeto selecionado e preserva clone/.venv_ready")
+    parser.add_argument("--isolation-launcher-json")
     parser.add_argument("--python", required=True, help="Python do ambiente dedicado com dependências de controle")
     parser.add_argument("--run-uid", type=int, required=True)
     parser.add_argument("--run-gid", type=int, required=True)
+    parser.add_argument("--dedicated-user", default="phase1runner",
+                        help="conta Unix dedicada esperada; padrão: phase1runner")
     parser.add_argument("--artifacts", type=Path, required=True, help="Diretório persistente gravável pelo usuário dedicado")
     parser.add_argument("--timeout-per-test", type=int, default=120)
     parser.add_argument("--clone-timeout", type=int, default=600)
@@ -292,20 +318,32 @@ def main() -> int:
     if args.run_uid == 0 or os.geteuid() != args.run_uid or os.getegid() != args.run_gid:
         parser.error("execute como o usuário dedicado; UID/GID efetivos devem corresponder aos argumentos e UID não pode ser 0")
     try:
+        effective_username = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        parser.error("UID efetivo não tem uma conta Unix identificável")
+    if effective_username != args.dedicated_user:
+        parser.error(
+            f"usuário efetivo {effective_username!r} não corresponde à conta dedicada esperada {args.dedicated_user!r}"
+        )
+    try:
         docker_gid = grp.getgrnam("docker").gr_gid
     except KeyError:
         docker_gid = None
     if docker_gid is not None and (docker_gid == os.getegid() or docker_gid in os.getgroups()):
         parser.error("o usuário dedicado não pode ter o grupo docker como grupo primário ou suplementar")
-    try:
-        launcher = json.loads(args.isolation_launcher_json)
-    except json.JSONDecodeError as exc:
-        parser.error(f"--isolation-launcher-json inválido: {exc}")
-    if not isinstance(launcher, list) or not launcher or not all(isinstance(x, str) for x in launcher):
-        parser.error("launcher deve ser uma lista JSON não vazia de argumentos")
-    executable = Path(launcher[0])
-    if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
-        parser.error("o primeiro argumento do launcher deve ser um executável absoluto")
+    launcher: list[str] = []
+    if not args.install_smoke_only:
+        if not args.isolation_launcher_json:
+            parser.error("--isolation-launcher-json é obrigatório fora de --install-smoke-only")
+        try:
+            launcher = json.loads(args.isolation_launcher_json)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--isolation-launcher-json inválido: {exc}")
+        if not isinstance(launcher, list) or not launcher or not all(isinstance(x, str) for x in launcher):
+            parser.error("launcher deve ser uma lista JSON não vazia de argumentos")
+        executable = Path(launcher[0])
+        if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
+            parser.error("o primeiro argumento do launcher deve ser um executável absoluto")
     if args.timeout_per_test <= 0 or args.clone_timeout <= 0 or args.install_timeout <= 0 or args.max_repo_bytes <= 0:
         parser.error("timeouts e limite do clone devem ser positivos")
 
@@ -331,14 +369,18 @@ def main() -> int:
         uv = shutil.which(args.uv, path=env["PATH"])
         if not uv:
             parser.error(f"uv não encontrado no PATH permitido: {env['PATH']}")
-        preflight = validate_isolation(args, temp_root, env)
+        preflight = (
+            {"passed": None, "status": "not_run_network_enabled_install_only"}
+            if args.install_smoke_only
+            else validate_isolation(args, temp_root, env)
+        )
         record: dict[str, Any] = {
             "created_at_epoch": int(time.time()),
             "sample": str(args.sample.resolve()),
             "isolation_preflight": preflight,
             "projects": [],
         }
-        if not preflight["passed"]:
+        if not args.install_smoke_only and not preflight["passed"]:
             record["status"] = "blocked_isolation_controls_failed"
             (artifacts / "dynamic_launcher_smoke.json").write_text(
                 json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -348,10 +390,38 @@ def main() -> int:
 
         for project in projects:
             pid, sha, url = project["project_id"], project["commit_sha"], project["url"]
-            repo = temp_root / f"repo-{pid}"
+            if args.install_smoke_only:
+                run_stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{time.time_ns() % 1_000_000_000:09d}"
+                persistent_run = artifacts / "install-smoke" / pid / run_stamp
+                persistent_run.mkdir(parents=True, exist_ok=False)
+                repo = persistent_run / "source"
+                uv_cache_root = persistent_run / "uv-cache"
+            else:
+                repo = temp_root / f"repo-{pid}"
+                uv_cache_root = temp_root / "uv-cache"
             project_record: dict[str, Any] = {
                 "project_id": pid, "commit_sha": sha, "url": redact(url),
+                "persistent_project_path": str(repo) if args.install_smoke_only else None,
+                "install_only": args.install_smoke_only,
             }
+            try:
+                repo.parent.mkdir(parents=True, exist_ok=True)
+                write_probe = repo.parent / ".phase1-write-check"
+                write_probe.write_text("ok", encoding="utf-8")
+                write_probe.unlink()
+                project_record["artifact_directory_writable"] = True
+            except OSError as exc:
+                project_record["artifact_directory_writable"] = False
+                project_record["artifact_write_error"] = f"{type(exc).__name__}: {exc}"
+                project_record["status"] = "artifact_directory_not_writable"
+                record["projects"].append(project_record)
+                if args.install_smoke_only:
+                    record["status"] = "installation_smoke_failed"
+                    report_path = artifacts / f"install_smoke_{pid}.json"
+                    report_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+                    print(json.dumps(record, indent=2, ensure_ascii=False))
+                    return 2
+                continue
             clone = run(["git", "clone", "--quiet", "--no-tags", url, str(repo)],
                         cwd=temp_root, env=env, timeout=args.clone_timeout)
             project_record["clone"] = clone
@@ -380,11 +450,16 @@ def main() -> int:
                 uv=uv,
                 base_env=env,
                 timeout=args.install_timeout,
-                cache_root=temp_root / "uv-cache",
+                cache_root=uv_cache_root,
             )
             project_record["dependency_installation"] = installation
             if not installation["ready"]:
                 project_record["status"] = "dependency_unresolvable"
+                record["projects"].append(project_record)
+                continue
+
+            if args.install_smoke_only:
+                project_record["status"] = "installation_smoke_passed"
                 record["projects"].append(project_record)
                 continue
 
@@ -415,12 +490,20 @@ def main() -> int:
             project_record["status"] = "setup_plan_complete" if execution["returncode"] == 0 else "setup_plan_failed"
             record["projects"].append(project_record)
 
-        record["status"] = "smoke_complete"
-        report_path = artifacts / "dynamic_launcher_smoke.json"
+        if args.install_smoke_only:
+            project_result = record["projects"][0] if record["projects"] else {}
+            passed = project_result.get("status") == "installation_smoke_passed"
+            record["status"] = "installation_smoke_passed" if passed else "installation_smoke_failed"
+            report_path = artifacts / f"install_smoke_{projects[0]['project_id']}.json"
+        else:
+            record["status"] = "smoke_complete"
+            report_path = artifacts / "dynamic_launcher_smoke.json"
         report_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
         print(json.dumps(record, indent=2, ensure_ascii=False))
+        if args.install_smoke_only and passed:
+            print(f"Ambiente persistido em: {project_result['dependency_installation']['python']}")
         print(f"Relatório salvo em: {report_path}")
-    return 0
+    return 0 if not args.install_smoke_only or passed else 2
 
 
 if __name__ == "__main__":

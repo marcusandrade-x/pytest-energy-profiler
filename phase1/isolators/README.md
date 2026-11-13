@@ -69,10 +69,10 @@ isolamento do socket.
 
 ## Smoke check do launcher dinâmico
 
-`scripts/phase1_dynamic_launcher.py` primeiro executa `phase1_runner.py`; se
-qualquer controle falhar, não clona nem executa projeto. Com os controles
-aprovados, clona apenas o primeiro projeto da amostra (ou o `--project-id`
-indicado), fixa o SHA e tenta instalar dependências. Cada estratégia usa um
+`scripts/phase1_dynamic_launcher.py` no modo normal primeiro executa
+`phase1_runner.py`; se qualquer controle falhar, não clona nem executa projeto.
+Com os controles aprovados, clona apenas o primeiro projeto da amostra (ou o
+`--project-id` indicado), fixa o SHA e tenta instalar dependências. Cada estratégia usa um
 `.venv_attempt_N` novo e um cache `uv` separado, sob o usuário dedicado e com
 timeout de 20 minutos. A ordem é `.[test]`, `.`, `requirements-test.txt`,
 `requirements-dev.txt` e `requirements.txt`, considerando somente manifests
@@ -90,3 +90,12 @@ Este smoke check instala dependências e faz o mapeamento inicial, mas ainda nã
 compara `--setup-only` com execução normal e não valida o corte K=3. Falhas de
 instalação são registradas como `dependency_unresolvable`, separadas das falhas
 de coleta e de isolamento.
+
+Para testar somente a cascata de instalação de um projeto, use
+`--install-smoke-only`. Esse modo mantém a instalação aberta à rede, exige o UID
+dedicado sem grupo Docker, não executa os controles nem testes do projeto, e
+preserva o clone e `.venv_ready` em `--artifacts/install-smoke/<project-id>/`.
+O relatório `install_smoke_<project-id>.json` contém a estratégia vencedora, a
+saída de `uv pip freeze`, a validação de que o ambiente promovido ainda importa
+pytest e o resultado do teste de escrita no diretório. Use-o somente para um
+projeto por chamada antes de liberar a fila completa.
