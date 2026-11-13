@@ -7,11 +7,24 @@ como shell. O protocolo do launcher é:
 LAUNCHER -- COMANDO ARGUMENTOS...
 ```
 
-O launcher de referência `sudo_unshare.sh` cria o namespace de rede, ativa
-`lo`, limpa grupos suplementares e inicia o comando como o UID/GID dedicado.
-Ele exige `sudo -n` habilitado para `unshare`; se algum pré-requisito falhar,
-retorna erro e o runner não aceita o ambiente. O teste não usa `sudo` para
-executar o código de projetos.
+O launcher `sudo_unshare.sh` chama um helper root-owned fixo. O helper cria os
+namespaces de rede/PID, ativa `lo`, limpa grupos suplementares e executa o
+comando como `phase1runner`. O usuário de estudo não recebe permissão geral para
+`sudo` ou `unshare`; o sudoers autoriza somente o helper instalado em
+`/usr/local/sbin/phase1-netns-root`.
+
+Instale o helper e a regra restrita com um administrador:
+
+```bash
+sudo install -o root -g root -m 0755 phase1/isolators/phase1-netns-root /usr/local/sbin/phase1-netns-root
+sudo install -o root -g root -m 0440 phase1/isolators/phase1runner.sudoers /etc/sudoers.d/phase1runner-netns
+sudo visudo -cf /etc/sudoers.d/phase1runner-netns
+```
+
+O helper confirma que os UID/GID solicitados são os de `phase1runner`, valida
+uma lista fixa de variáveis de ambiente, configura `lo` como root e só depois
+faz `setpriv --clear-groups` antes de executar o argv recebido. O arquivo
+instalado precisa permanecer gravável apenas por root.
 
 ## Preparação fora do executor
 
@@ -62,8 +75,8 @@ todos enviados pelo mesmo launcher. Qualquer controle reprovado resulta em
 código de saída diferente de zero e impede a liberação do piloto. O relatório é
 salvo em `workspace/phase1-validation/validation/isolation_validation.json`.
 
-`sudo_unshare.sh` também cria namespaces PID e monta `/proc` dentro do namespace.
-O processo permanece com o UID não privilegiado. O controle Docker verifica
+`phase1-netns-root` também cria um namespace PID e monta `/proc` dentro dele.
+O processo de teste permanece com UID não-root. O controle Docker verifica
 conexão real ao socket; limpar grupos, por si só, não é considerado prova de
 isolamento do socket.
 

@@ -1,0 +1,3 @@
+# Grants only the fixed root-owned namespace helper to the study account.
+# The helper itself drops to phase1runner before executing the requested argv.
+phase1runner ALL=(root) NOPASSWD: /usr/local/sbin/phase1-netns-root

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Install root-owned at /usr/local/sbin/phase1-netns-root.
+# Sudoers grants phase1runner access to this fixed helper only.
+set -euo pipefail
+
+die() { echo "phase1-netns-root: $*" >&2; exit 64; }
+[[ "$EUID" == 0 ]] || die "must be invoked by sudo as root"
+[[ "$#" -ge 5 ]] || die "usage: phase1-netns-root UID GID -- [ENV=VALUE ...] -- COMMAND [ARGS...]"
+
+requested_uid="$1"
+requested_gid="$2"
+shift 2
+[[ "$requested_uid" =~ ^[0-9]+$ && "$requested_gid" =~ ^[0-9]+$ ]] || die "UID/GID must be numeric"
+[[ "${1:-}" == "--" ]] || die "missing environment separator"
+shift
+
+env_args=()
+while [[ "$#" -gt 0 && "$1" != "--" ]]; do
+  assignment="$1"
+  shift
+  name="${assignment%%=*}"
+  [[ "$assignment" == *=* ]] || die "malformed environment assignment"
+  case "$name" in
+    PATH|HOME|TMPDIR|LANG|LC_ALL|PYTHONPATH|PYTHONUNBUFFERED|PHASE1_PROJECT_ID|PHASE1_PROJECT_ROOT|PHASE1_RUN_ID|PHASE1_OUTPUT)
+      env_args+=("$assignment")
+      ;;
+    *) die "environment variable is not allowlisted: $name" ;;
+  esac
+done
+[[ "${1:-}" == "--" ]] || die "missing command separator"
+shift
+[[ "$#" -gt 0 ]] || die "missing command"
+
+target_uid="$(/usr/bin/id -u phase1runner)"
+target_gid="$(/usr/bin/id -g phase1runner)"
+[[ "$requested_uid" == "$target_uid" && "$requested_gid" == "$target_gid" ]] || die "requested identity is not phase1runner"
+docker_gid="$(/usr/bin/getent group docker | /usr/bin/cut -d: -f3 || true)"
+[[ -z "$docker_gid" || "$target_gid" != "$docker_gid" ]] || die "phase1runner primary group is docker"
+
+exec /usr/bin/unshare --net --pid --fork --mount-proc -- /bin/bash -c '
+  set -euo pipefail
+  uid="$1"; gid="$2"; shift 2
+  env_args=()
+  while [[ "$#" -gt 0 && "$1" != "--" ]]; do env_args+=("$1"); shift; done
+  [[ "${1:-}" == "--" ]] || exit 64
+  shift
+  [[ "$#" -gt 0 ]] || exit 64
+  /usr/sbin/ip link set lo up
+  exec /usr/bin/setpriv --reuid="$uid" --regid="$gid" --clear-groups -- \
+    /usr/bin/env -i "${env_args[@]}" "PHASE1_RUN_UID=$uid" "PHASE1_RUN_GID=$gid" "$@"
+' phase1-netns "$target_uid" "$target_gid" "${env_args[@]}" -- "$@"
