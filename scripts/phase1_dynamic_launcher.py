@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Fail-closed pilot readiness and dependency-installation smoke check.
 
-This script is deliberately not the full pilot runner. It validates the exact
-isolation launcher with ``phase1_runner.py`` before cloning or executing any
-project, then performs one bounded collection smoke check. Pilot measurements,
-the setup-only/normal comparison and K=3 validation remain separate steps.
+This script is deliberately not the full pilot runner. In normal mode it
+validates the exact isolation launcher with ``phase1_runner.py`` before cloning
+or executing a project, then performs one bounded collection smoke check.
+``--install-smoke-only`` runs only the network-enabled dependency cascade and
+preserves its successful environment. Pilot measurements, the setup-only/normal
+comparison and K=3 validation remain separate steps.
 """
 
 from __future__ import annotations
