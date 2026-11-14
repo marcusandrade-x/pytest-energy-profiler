@@ -21,7 +21,8 @@ if [[ -n "$docker_gid" && "$gid" == "$docker_gid" ]]; then
 fi
 
 safe_names=(PATH HOME TMPDIR LANG LC_ALL PYTHONPATH PYTHONUNBUFFERED
-            PHASE1_PROJECT_ID PHASE1_PROJECT_ROOT PHASE1_RUN_ID PHASE1_OUTPUT)
+            PHASE1_PROJECT_ID PHASE1_PROJECT_ROOT PHASE1_RUN_ID PHASE1_OUTPUT
+            PHASE1_STATIC_INVENTORY PHASE1_PRIOR_DEPENDENCY_MAP PHASE1_CIRCUIT_BREAKER_K)
 env_args=()
 for name in "${safe_names[@]}"; do
   if [[ -v "$name" ]]; then env_args+=("$name=${!name}"); fi

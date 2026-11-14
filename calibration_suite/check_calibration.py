@@ -3,14 +3,14 @@
 
 Uso (a partir da raiz da suíte de calibração):
 
-    python fixture_energy_profiler.py --energy-project-only \
+    python ../tools/fixture_energy_profiler.py --energy-project-only \
         --energy-country-iso-code BRA --energy-output-dir out -p no:cacheprovider -q
     python check_calibration.py out
 
 Verifica ESTRUTURA e DURAÇÕES (determinísticas), não valores de energia: a energia
 depende do backend do CodeCarbon e só é impressa (razão observada/esperada) para
 inspeção humana. Rode uma vez por versão de pytest que pretende aceitar
-(`run_contract_matrix.sh`).
+(`contract_matrix.sh`).
 """
 import csv
 import json

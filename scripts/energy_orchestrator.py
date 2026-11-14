@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Orquestrador de medição de energia de suítes pytest (clone -> venv -> baseline -> profiler).
 
-Lê o CSV do minerador (`mine_projects.csv`), pega os candidatos elegíveis
+Lê o CSV do minerador (`input_data/mined_projects.csv` por padrão), pega os candidatos elegíveis
 (`motivo_exclusao` vazio) e, para cada um, automatiza:
 
     clone (commit fixado) -> venv + instalação -> baseline -> N medições com o profiler
@@ -80,7 +80,7 @@ Comandos
 
 Exemplo
 -------
-    python energy_orchestrator.py rodar --resultados mine_projects.csv \\
+    python energy_orchestrator.py rodar --resultados input_data/mined_projects.csv \\
         --lote 20 --jobs 3 --reps 3 --pais BRA
 """
 
@@ -123,6 +123,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("orquestrador")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Variáveis herdadas pelos processos de terceiros. GITHUB_TOKEN e afins ficam FORA.
 ENV_ALLOWLIST = (
@@ -1701,12 +1702,14 @@ def cmd_rodar(cfg, projects, overrides, installer) -> None:
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--workspace", type=Path, default=Path("workspace"))
-    common.add_argument("--resultados", type=Path, default=Path("mine_projects.csv"),
+    common.add_argument("--resultados", type=Path,
+                        default=PROJECT_ROOT / "input_data" / "mined_projects.csv",
                         help="CSV gerado pelo minerador (usa linhas com motivo_exclusao vazio).")
     common.add_argument("--coluna-commit", default="commit_sha",
                         help="Coluna do CSV do minerador com o SHA analisado (fixa o commit do clone).")
-    common.add_argument("--profiler", type=Path, default=Path(__file__).with_name("fixture_energy_profiler.py"))
-    common.add_argument("--overrides", type=Path, default=Path("overrides.json"),
+    common.add_argument("--profiler", type=Path,
+                        default=PROJECT_ROOT / "tools" / "fixture_energy_profiler.py")
+    common.add_argument("--overrides", type=Path, default=PROJECT_ROOT / "overrides.json",
                         help="JSON com ajustes por projeto (python, install, pytest_args, env, skip).")
     common.add_argument("--python", default=sys.executable, help="Python base para criar os venvs.")
     common.add_argument("--instalador", choices=("auto", "pip", "uv"), default="auto")

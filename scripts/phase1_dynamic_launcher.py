@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Fail-closed pilot readiness and dependency-installation smoke check.
+"""Run the fail-closed Phase 1 feasibility pilot.
 
-This script is deliberately not the full pilot runner. In normal mode it
-validates the exact isolation launcher with ``phase1_runner.py`` before cloning
-or executing a project, then performs one bounded collection smoke check.
-``--install-smoke-only`` runs only the network-enabled dependency cascade and
-preserves its successful environment. Pilot measurements, the setup-only/normal
-comparison and K=3 validation remain separate steps.
+Installation runs online as the dedicated user. Collection and pytest phases
+run only after the isolation controls pass for that project's environment.
+The executor records two collections, a setup plan, two full runs, and for a
+preselected subset the setup-only comparison and K=3 circuit-breaker run.
 """
 
 from __future__ import annotations
@@ -23,15 +21,27 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from pathlib import Path
 from typing import Any
 
+try:  # Supports both direct script execution and importing from unit tests.
+    from phase1_catalog import (
+        catalog_project, catalog_test_modules_details, collection_is_viable,
+        stable_test_ids, summarize_fixture_repetitions,
+    )
+except ModuleNotFoundError:  # pragma: no cover - exercised by module imports
+    from scripts.phase1_catalog import (
+        catalog_project, catalog_test_modules_details, collection_is_viable,
+        stable_test_ids, summarize_fixture_repetitions,
+    )
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "phase1_runner.py"
-SAMPLE = ROOT / "phase1" / "pilot_sample.csv"
+SAMPLE = ROOT / "phase1" / "data" / "pilot" / "pilot_sample.csv"
 SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$")
 URL_CREDENTIALS_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
@@ -41,46 +51,70 @@ URL_QUERY_SECRET_RE = re.compile(r"(?i)([?&](?:token|access_token|password|key)=
 def run(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int) -> dict[str, Any]:
     """Run argv without a shell and retain bounded output and timeout status."""
     started = time.monotonic()
-    proc: subprocess.Popen[str] | None = None
+    proc: subprocess.Popen[bytes] | None = None
+    tails = {"stdout": bytearray(), "stderr": bytearray()}
+
+    def drain(name: str, stream: Any) -> None:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            tail = tails[name]
+            tail.extend(chunk)
+            if len(tail) > 20000:
+                del tail[:-20000]
+
     try:
         proc = subprocess.Popen(
             argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
+            start_new_session=True,
         )
-        stdout, stderr = proc.communicate(timeout=timeout)
+        readers = [
+            threading.Thread(target=drain, args=(name, stream), daemon=True)
+            for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))
+        ]
+        for reader in readers:
+            reader.start()
+        proc.wait(timeout=timeout)
+        for reader in readers:
+            reader.join()
+        proc.stdout.close()
+        proc.stderr.close()
         return {
             "argv": [redact(str(arg)) for arg in argv],
             "returncode": proc.returncode,
             "timed_out": False,
             "seconds": round(time.monotonic() - started, 3),
-            "stdout": redact(stdout[-20000:]),
-            "stderr": redact(stderr[-20000:]),
+            "stdout": redact(bytes(tails["stdout"]).decode("utf-8", "replace")),
+            "stderr": redact(bytes(tails["stderr"]).decode("utf-8", "replace")),
         }
     except subprocess.TimeoutExpired:
-        stdout = ""
-        stderr = ""
         if proc is not None:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             try:
-                stdout, stderr = proc.communicate(timeout=5)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                stdout, stderr = proc.communicate()
-            except ProcessLookupError:
-                stdout, stderr = proc.communicate()
+                proc.wait()
+            for reader in locals().get("readers", []):
+                reader.join()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
         return {
             "argv": [redact(str(arg)) for arg in argv],
             "returncode": None,
             "timed_out": True,
             "seconds": round(time.monotonic() - started, 3),
-            "stdout": redact(stdout[-20000:]),
-            "stderr": redact(stderr[-20000:]),
+            "stdout": redact(bytes(tails["stdout"]).decode("utf-8", "replace")),
+            "stderr": redact(bytes(tails["stderr"]).decode("utf-8", "replace")),
         }
     except OSError as exc:
         return {
@@ -149,8 +183,25 @@ def remove_ready_venv(repo: Path, ready: Path) -> None:
         shutil.rmtree(ready)
 
 
-def project_python_request(repo: Path, fallback: str) -> str:
+def repository_working_tree_bytes(repo: Path) -> int:
+    """Count source checkout size without VCS metadata or generated virtualenvs."""
+    total = 0
+    for current, dirs, files in os.walk(repo, topdown=True, followlinks=False):
+        dirs[:] = [name for name in dirs if name != ".git" and not name.startswith(".venv_") and name != ".venv_ready"]
+        for name in files:
+            path = Path(current) / name
+            try:
+                if not path.is_symlink():
+                    total += path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def project_python_request(repo: Path, fallback: str, override: str | None = None) -> str:
     """Prefer the project's declared Python range over the host interpreter."""
+    if override:
+        return override
     pyproject = repo / "pyproject.toml"
     if pyproject.is_file():
         try:
@@ -174,6 +225,7 @@ def project_python_request(repo: Path, fallback: str) -> str:
 def install_project_dependencies(
     repo: Path, *, project_id: str, python: str, uv: str,
     base_env: dict[str, str], timeout: int, cache_root: Path,
+    python_request_override: str | None = None,
 ) -> dict[str, Any]:
     """Try each install recipe in a fresh venv and promote the first success."""
     strategies = installation_strategies(repo)
@@ -183,7 +235,7 @@ def install_project_dependencies(
         return result
 
     ready = repo / ".venv_ready"
-    python_request = project_python_request(repo, python)
+    python_request = project_python_request(repo, python, python_request_override)
     result["python_request"] = python_request
     for index, (strategy_name, install_args) in enumerate(strategies, start=1):
         attempt = repo / f".venv_attempt_{index}"
@@ -292,7 +344,8 @@ def load_sample(path: Path) -> list[dict[str, str]]:
 
 
 def clean_environment(args: argparse.Namespace, temp_root: Path) -> dict[str, str]:
-    python = Path(args.python).resolve()
+    # Preserve a virtualenv's bin/python symlink; resolving it bypasses that venv.
+    python = Path(os.path.abspath(args.python))
     return {
         "PATH": f"{python.parent}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME": str(temp_root / "home"),
@@ -300,18 +353,20 @@ def clean_environment(args: argparse.Namespace, temp_root: Path) -> dict[str, st
         "UV_PYTHON_INSTALL_DIR": str(args.python_install_dir.resolve()),
         "LANG": "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PHASE1_RUN_UID": str(args.run_uid),
         "PHASE1_RUN_GID": str(args.run_gid),
     }
 
 
-def validate_isolation(args: argparse.Namespace, temp_root: Path, env: dict[str, str]) -> dict[str, Any]:
+def validate_isolation(args: argparse.Namespace, temp_root: Path, env: dict[str, str],
+                       python: str | None = None) -> dict[str, Any]:
     validation_dir = temp_root / "validation"
     validation_dir.mkdir(parents=True, exist_ok=True)
     argv = [
         sys.executable, str(RUNNER),
         "--isolation-launcher-json", args.isolation_launcher_json,
-        "--python", str(Path(args.python).resolve()),
+        "--python", os.path.abspath(python or args.python),
         "--run-uid", str(args.run_uid), "--run-gid", str(args.run_gid),
         "--workspace", str(validation_dir),
         "--timeout-per-test", str(args.timeout_per_test),
@@ -326,15 +381,602 @@ def validate_isolation(args: argparse.Namespace, temp_root: Path, env: dict[str,
             "passed": result["returncode"] == 0 and report.get("passed") is True}
 
 
+def _probe_environment(base: dict[str, str], *, project_id: str, repo: Path,
+                       run_id: str, output: Path, prior_map: Path | None = None,
+                       circuit_breaker_k: int = 0) -> dict[str, str]:
+    env = dict(base)
+    env.update({
+        "PHASE1_PROJECT_ID": project_id,
+        "PHASE1_PROJECT_ROOT": str(repo),
+        "PHASE1_RUN_ID": run_id,
+        "PHASE1_OUTPUT": str(output),
+        "PHASE1_STATIC_INVENTORY": str(output.parent / "static_inventory.json"),
+        "PYTHONPATH": str(ROOT / "scripts"),
+    })
+    if circuit_breaker_k:
+        env["PHASE1_CIRCUIT_BREAKER_K"] = str(circuit_breaker_k)
+    if prior_map:
+        env["PHASE1_PRIOR_DEPENDENCY_MAP"] = str(prior_map)
+    return env
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _read_project_checkpoint(project_dir: Path) -> dict[str, Any]:
+    """Read the tiny checkpoint index, or scan headers of legacy large results."""
+    index = _read_json(project_dir / "project_checkpoint.json")
+    if index:
+        return index
+    legacy = project_dir / "project_result.json"
+    if not legacy.is_file():
+        return {}
+    try:
+        if legacy.stat().st_size > 100_000_000:
+            return {}
+    except OSError:
+        return {}
+    found: dict[str, Any] = {}
+    wanted = {"project_id", "commit_sha", "tooling_fingerprint", "status"}
+    try:
+        with legacy.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                for key in wanted - found.keys():
+                    match = re.match(rf'^  "{key}"\s*:\s*("(?:[^"\\]|\\.)*"|[^,]+)', line)
+                    if match:
+                        try:
+                            found[key] = json.loads(match.group(1))
+                        except json.JSONDecodeError:
+                            pass
+                if wanted.issubset(found):
+                    break
+    except OSError:
+        return {}
+    return found
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _compact_project_record(project: dict[str, Any], checkpoint: Path | None = None) -> dict[str, Any]:
+    """Keep the in-memory progress record small; detailed probe data stays in its checkpoint."""
+    compact: dict[str, Any] = {
+        key: project[key] for key in (
+            "project_id", "commit_sha", "url", "status", "tooling_fingerprint",
+            "collection_fraction", "collection_viable", "collection_ids_stable",
+            "collected_item_count", "ast_test_definitions", "ast_test_functions",
+            "ast_test_item_estimate", "unexpanded_parametrized_function_count",
+            "dynamic_collection_hook_module_count", "collection_ratio_is_lower_bound",
+            "collection_loss",
+            "collection_minimum_fraction", "setup_only_comparison_selected",
+            "fixture_repetition_summary", "incomplete_execution", "clone", "checkout",
+        ) if key in project
+    }
+    if project.get("setup_only_discordance"):
+        discordance = project["setup_only_discordance"]
+        compact["setup_only_discordance"] = {
+            key: discordance.get(key) for key in (
+                "test_id_discordance_rate", "fixture_setup_discordance_rate",
+                "setup_only_teardown_failures", "normal_teardown_failures",
+            )
+        }
+        compact["setup_only_discordance"]["test_id_symmetric_difference_count"] = len(
+            discordance.get("test_id_symmetric_difference", [])
+        )
+        compact["setup_only_discordance"]["fixture_setup_symmetric_difference_count"] = len(
+            discordance.get("fixture_setup_symmetric_difference", [])
+        )
+    if project.get("circuit_breaker_comparison"):
+        breaker = project["circuit_breaker_comparison"]
+        compact["circuit_breaker_comparison"] = {
+            key: breaker.get(key) for key in (
+                "k", "aborted_test_count", "full_run_elapsed_seconds",
+                "circuit_breaker_elapsed_seconds", "elapsed_seconds_delta",
+            )
+        }
+    install = project.get("dependency_installation", {})
+    if install:
+        compact["dependency_installation"] = {
+            key: install.get(key) for key in ("ready", "status", "python", "successful_strategy")
+        }
+    compact["python_candidate_attempts"] = [
+        {key: item.get(key) for key in ("candidate_order", "python_request", "status", "collection_fraction")}
+        for item in project.get("python_candidate_attempts", [])
+    ]
+    compact["collection_runs"] = [
+        {
+            "returncode": row.get("run", {}).get("returncode"),
+            "timed_out": row.get("run", {}).get("timed_out", False),
+            "seconds": row.get("run", {}).get("seconds"),
+            "test_count": len(row.get("metadata", {}).get("test_ids", [])),
+            "collection_error_count": len(row.get("metadata", {}).get("collection_errors", [])),
+        }
+        for row in project.get("collection_runs", [])
+    ]
+    compact["collection_error_count"] = len(project.get("collection_errors", []))
+    compact["setup_plan_summary"] = {
+        "returncode": project.get("setup_plan", {}).get("run", {}).get("returncode"),
+        "timed_out": project.get("setup_plan", {}).get("run", {}).get("timed_out", False),
+        "test_count": len(project.get("setup_plan_test_ids", [])),
+    }
+    for phase_name in ("setup_only", "circuit_breaker_k3"):
+        phase = project.get(phase_name)
+        if phase:
+            compact[f"{phase_name}_summary"] = {
+                "returncode": phase.get("run", {}).get("returncode"),
+                "timed_out": phase.get("run", {}).get("timed_out", False),
+                "seconds": phase.get("run", {}).get("seconds"),
+            }
+    if project.get("pytest_run_classification"):
+        compact["pytest_run_classification"] = project["pytest_run_classification"]
+    compact["execution_runs"] = []
+    fixture_errors: dict[str, dict[str, Any]] = {}
+    for run_index, run_record in enumerate(project.get("execution_runs", []), start=1):
+        run = run_record.get("run", {})
+        metadata = run_record.get("metadata", {})
+        events = metadata.get("fixture_events", [])
+        run_summary = {
+            "run_index": run_index,
+            "returncode": run.get("returncode"), "timed_out": run.get("timed_out", False),
+            "seconds": run.get("seconds"), "test_count": len(metadata.get("test_ids", [])),
+            "fixture_event_count": len(events),
+        }
+        run_summary["completion"] = (
+            "completed" if _pytest_execution_completed(run)
+            else "timeout" if run.get("timed_out")
+            else "terminated_or_aborted"
+        )
+        compact["execution_runs"].append(run_summary)
+        for event in events:
+            if event.get("status") != "failed":
+                continue
+            signature = str(event.get("signature") or f"{event.get('exception_class')}|{event.get('message')}")
+            failure = fixture_errors.setdefault(signature, {
+                "signature": signature, "exception_class": event.get("exception_class"),
+                "message": event.get("message"), "innermost_frame": event.get("innermost_frame"),
+                "occurrences": 0,
+            })
+            failure["occurrences"] += 1
+    compact["fixture_errors"] = list(fixture_errors.values())
+    if checkpoint is not None:
+        compact["checkpoint"] = str(checkpoint)
+    return compact
+
+
+def _progress_manifest(record: dict[str, Any]) -> dict[str, Any]:
+    """Progress is a small index, never a duplicate of full project artifacts."""
+    return {
+        "schema_version": 2,
+        "created_at_epoch": record.get("created_at_epoch"),
+        "status": record.get("status"),
+        "tooling_fingerprint": record.get("tooling_fingerprint"),
+        "sample": record.get("sample"),
+        "projects": record.get("projects", []),
+    }
+
+
+def _pytest_execution_completed(run: dict[str, Any]) -> bool:
+    """Pytest rc=1 means tests/collection failed but the run finished; negative/2+ did not."""
+    code = run.get("returncode")
+    return not run.get("timed_out", False) and isinstance(code, int) and 0 <= code <= 1
+
+
+def _isolated_pytest(args: argparse.Namespace, *, temp_root: Path,
+                     base_env: dict[str, str], launcher: list[str],
+                     python: str, repo: Path, project_id: str, run_id: str,
+                     artifact_dir: Path, mode: str, timeout: int,
+                     prior_map: Path | None = None, circuit_breaker_k: int = 0,
+                     deselect: list[str] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run a single isolated pytest phase, validating the sandbox each time."""
+    preflight = validate_isolation(args, temp_root, base_env, python=python)
+    if not preflight["passed"]:
+        return ({"returncode": 125, "timed_out": False, "seconds": 0,
+                 "stdout": "", "stderr": "isolation controls failed",
+                 "isolation_preflight": preflight}, {})
+    output = artifact_dir / f"{run_id}.json"
+    env = _probe_environment(
+        base_env, project_id=project_id, repo=repo, run_id=run_id,
+        output=output, prior_map=prior_map, circuit_breaker_k=circuit_breaker_k,
+    )
+    command = [python, "-m", "pytest", "--continue-on-collection-errors",
+               "-p", "no:cacheprovider", "-p", "no:randomly",
+               "-p", "no:random_order", "-p", "no:pytest_random_order",
+               "--timeout", str(args.timeout_per_test), "--timeout-method=signal",
+               "-p", "phase1_probe", "-q"]
+    if mode == "collect-only":
+        command += ["--collect-only"]
+    elif mode == "setup-plan":
+        command += ["--setup-plan"]
+    elif mode == "setup-only":
+        command += ["--setup-only"]
+    elif mode != "normal":
+        raise ValueError(f"modo pytest desconhecido: {mode}")
+    command.extend(f"--deselect={nodeid}" for nodeid in (deselect or []))
+    result = run([*launcher, "--", *command], cwd=repo,
+                 env=env, timeout=timeout)
+    metadata = _read_json(output)
+    result["isolation_preflight"] = preflight
+    result["probe_artifact"] = str(output)
+    return result, metadata
+
+
+def _collection_loss_estimate(errors: list[dict[str, Any]], module_counts: dict[str, int]) -> dict[str, Any]:
+    estimates: dict[str, int] = {}
+    for error in errors:
+        location = str(error.get("nodeid") or error.get("location") or "")
+        module = location.split("::", 1)[0].replace("\\", "/")
+        if module in module_counts:
+            estimates[module] = module_counts[module]
+    return {
+        "failed_modules": sorted(estimates),
+        "estimated_ast_test_items_lost": sum(estimates.values()),
+        "estimated_ast_test_definitions_lost": sum(estimates.values()),
+        "per_module_ast_test_definitions": estimates,
+    }
+
+
+def _process_pilot_project(args: argparse.Namespace, *, project: dict[str, str],
+                           repo: Path, python: str, temp_root: Path,
+                           base_env: dict[str, str], launcher: list[str],
+                           project_dir: Path, comparison_ids: set[str],
+                           run_prefix: str = "") -> dict[str, Any]:
+    pid = project["project_id"]
+    run_id = lambda label: f"{run_prefix}-{label}" if run_prefix else label
+    project_dir.mkdir(parents=True, exist_ok=True)
+    module_details = catalog_test_modules_details(repo)
+    module_counts = {
+        module: details["estimated_test_items"]
+        for module, details in module_details.items()
+    }
+    ast_test_functions = sum(details["ast_test_functions"] for details in module_details.values())
+    unexpanded_parametrized = [
+        {"module": module, **function}
+        for module, details in module_details.items()
+        for function in details["unexpanded_parametrized_functions"]
+    ]
+    dynamic_collection_modules = [
+        module for module, details in module_details.items()
+        if details["has_pytest_generate_tests_hook"]
+    ]
+    fixtures = catalog_project(repo, pid, project.get("commit_sha", ""))
+    _write_json(project_dir / "static_inventory.json", {
+        "project_id": pid, "commit_sha": project.get("commit_sha"),
+        "test_modules": module_counts,
+        "test_module_details": module_details,
+        "ast_test_functions": ast_test_functions,
+        "estimated_ast_test_items": sum(module_counts.values()),
+        "fixtures": fixtures,
+    })
+    result: dict[str, Any] = {
+        "project_id": pid, "commit_sha": project.get("commit_sha"),
+        "project_path": str(repo), "static_test_modules": len(module_counts),
+        "ast_test_definitions": ast_test_functions,
+        "ast_test_item_estimate": sum(module_counts.values()),
+        "ast_test_functions": ast_test_functions,
+        "unexpanded_parametrized_function_count": len(unexpanded_parametrized),
+        "unexpanded_parametrized_functions": unexpanded_parametrized,
+        "dynamic_collection_hook_module_count": len(dynamic_collection_modules),
+        "collection_runs": [], "execution_runs": [],
+    }
+
+    # Two independent collections establish deterministic IDs before tests run.
+    for index in (1, 2):
+        collect_run_id = run_id(f"collect-{index}")
+        phase, metadata = _isolated_pytest(
+            args, temp_root=temp_root, base_env=base_env, launcher=launcher,
+            python=python, repo=repo, project_id=pid, run_id=collect_run_id,
+            artifact_dir=project_dir, mode="collect-only", timeout=30 * 60,
+        )
+        result["collection_runs"].append({"run": phase, "metadata": metadata})
+        if not phase.get("isolation_preflight", {}).get("passed", False):
+            result.update(status="blocked_isolation_controls_failed")
+            return result
+    first_ids = result["collection_runs"][0]["metadata"].get("test_ids", [])
+    second_ids = result["collection_runs"][1]["metadata"].get("test_ids", [])
+    ids_stable = stable_test_ids(first_ids, second_ids)
+    result["collection_ids_stable"] = ids_stable
+    result["collected_item_count"] = len(set(first_ids))
+    result["collection_errors"] = result["collection_runs"][1]["metadata"].get("collection_errors", [])
+    result["collection_loss"] = _collection_loss_estimate(result["collection_errors"], module_counts)
+    result["collection_fraction"] = (
+        result["collected_item_count"] / result["ast_test_item_estimate"]
+        if result["ast_test_item_estimate"] else 0.0
+    )
+    result["collection_ratio_is_lower_bound"] = bool(
+        unexpanded_parametrized or dynamic_collection_modules
+    )
+    result["collection_minimum_fraction"] = args.collection_min_fraction
+    result["collection_viable"] = collection_is_viable(
+        result["collected_item_count"], result["ast_test_item_estimate"], args.collection_min_fraction
+    )
+    if not ids_stable:
+        result["status"] = "collection_ids_unstable"
+        return result
+    if not result["collection_viable"]:
+        result["status"] = "collection_below_provisional_fraction_threshold"
+        return result
+
+    # Persist an explicit, SHA-bound deselection manifest before execution.
+    manifest_path = project_dir / "deselection_manifest.json"
+    manifest = _read_json(manifest_path)
+    if manifest:
+        if manifest.get("commit_sha") != project.get("commit_sha"):
+            result["status"] = "deselection_manifest_sha_mismatch"
+            return result
+        ids_digest = __import__("hashlib").sha256(
+            "\n".join(sorted(set(first_ids))).encode("utf-8")
+        ).hexdigest()
+        if manifest.get("collected_ids_sha256") != ids_digest:
+            result["status"] = "deselection_manifest_collection_mismatch"
+            return result
+        deselected = manifest.get("deselected_ids", [])
+        if not isinstance(deselected, list) or not set(deselected).issubset(set(first_ids)):
+            result["status"] = "deselection_manifest_invalid"
+            return result
+    else:
+        deselected = []
+        manifest = {
+            "schema_version": 1, "project_id": pid,
+            "commit_sha": project.get("commit_sha"),
+            "collected_ids_sha256": __import__("hashlib").sha256(
+                "\n".join(sorted(set(first_ids))).encode("utf-8")
+            ).hexdigest(),
+            "deselected_ids": [],
+        }
+        _write_json(manifest_path, manifest)
+    result["deselection_manifest"] = str(manifest_path)
+    result["deselected_count"] = len(deselected)
+
+    plan, plan_meta = _isolated_pytest(
+        args, temp_root=temp_root, base_env=base_env, launcher=launcher,
+        python=python, repo=repo, project_id=pid, run_id=run_id("setup-plan"),
+        artifact_dir=project_dir, mode="setup-plan", timeout=30 * 60,
+        deselect=deselected,
+    )
+    result["setup_plan"] = {"run": plan, "metadata": plan_meta}
+    if not plan.get("isolation_preflight", {}).get("passed", False):
+        result["status"] = "blocked_isolation_controls_failed"
+        return result
+    result["setup_plan_test_ids"] = plan_meta.get("test_ids", [])
+
+    # A deterministic comparison cohort is fixed by the caller before execution.
+    compare = pid in comparison_ids
+    result["setup_only_comparison_selected"] = compare
+    if compare:
+        setup_only, setup_meta = _isolated_pytest(
+            args, temp_root=temp_root, base_env=base_env, launcher=launcher,
+            python=python, repo=repo, project_id=pid, run_id=run_id("setup-only"),
+            artifact_dir=project_dir, mode="setup-only", timeout=30 * 60,
+            deselect=deselected,
+        )
+        result["setup_only"] = {"run": setup_only, "metadata": setup_meta}
+        if not setup_only.get("isolation_preflight", {}).get("passed", False):
+            result["status"] = "blocked_isolation_controls_failed"
+            return result
+        if not _pytest_execution_completed(setup_only):
+            result["status"] = "setup_only_execution_incomplete"
+            return result
+
+    for index in (1, 2):
+        execution_run_id = run_id(f"normal-{index}")
+        execution, metadata = _isolated_pytest(
+            args, temp_root=temp_root, base_env=base_env, launcher=launcher,
+            python=python, repo=repo, project_id=pid, run_id=execution_run_id,
+            artifact_dir=project_dir, mode="normal", timeout=30 * 60,
+            deselect=deselected,
+        )
+        result["execution_runs"].append({"run": execution, "metadata": metadata})
+        if not execution.get("isolation_preflight", {}).get("passed", False):
+            result["status"] = "blocked_isolation_controls_failed"
+            return result
+        if not _pytest_execution_completed(execution):
+            result["status"] = "pytest_execution_incomplete"
+            result["incomplete_execution"] = {
+                "run_index": index,
+                "returncode": execution.get("returncode"),
+                "timed_out": execution.get("timed_out", False),
+                "classification": (
+                    "timeout" if execution.get("timed_out")
+                    else "terminated_by_signal" if isinstance(execution.get("returncode"), int)
+                    and execution["returncode"] < 0
+                    else "pytest_aborted_or_internal_error"
+                ),
+            }
+            return result
+    if compare:
+        normal_meta = result["execution_runs"][0]["metadata"]
+        prior_map_path = project_dir / "runtime_dependency_map.json"
+        _write_json(prior_map_path, normal_meta.get("test_to_fixtures", {}))
+        breaker_run, breaker_meta = _isolated_pytest(
+            args, temp_root=temp_root, base_env=base_env, launcher=launcher,
+            python=python, repo=repo, project_id=pid, run_id=run_id("normal-k3"),
+            artifact_dir=project_dir, mode="normal", timeout=30 * 60,
+            prior_map=prior_map_path, circuit_breaker_k=3, deselect=deselected,
+        )
+        result["circuit_breaker_k3"] = {"run": breaker_run, "metadata": breaker_meta}
+        if not breaker_run.get("isolation_preflight", {}).get("passed", False):
+            result["status"] = "blocked_isolation_controls_failed"
+            return result
+        if not _pytest_execution_completed(breaker_run):
+            result["status"] = "circuit_breaker_execution_incomplete"
+            return result
+        full_ids = set(normal_meta.get("test_ids", []))
+        aborted_ids = {
+            entry.get("nodeid")
+            for entry in breaker_meta.get("circuit_breaker", {}).get("aborted_tests", [])
+        }
+        full_outcomes = normal_meta.get("test_phase_outcomes", {})
+        full_seconds = float(result["execution_runs"][0]["run"].get("seconds", 0))
+        breaker_seconds = float(breaker_run.get("seconds", 0))
+        result["circuit_breaker_comparison"] = {
+            "k": 3,
+            "aborted_test_ids": sorted(aborted_ids),
+            "aborted_ids_in_full_run": sorted(aborted_ids & full_ids),
+            "aborted_test_count": len(aborted_ids),
+            "full_run_elapsed_seconds": full_seconds,
+            "circuit_breaker_elapsed_seconds": breaker_seconds,
+            "elapsed_seconds_delta": round(full_seconds - breaker_seconds, 3),
+            "full_run_outcomes_for_aborted": {
+                nodeid: full_outcomes.get(nodeid, {}) for nodeid in sorted(aborted_ids & full_ids)
+            },
+        }
+    if compare:
+        setup_meta = result["setup_only"]["metadata"]
+        normal_meta = result["execution_runs"][0]["metadata"]
+        setup_events = setup_meta.get("fixture_events", [])
+        normal_events = normal_meta.get("fixture_events", [])
+        setup_fixtures = {e.get("fixture_id") for e in setup_events if e.get("phase") == "setup"}
+        normal_fixtures = {e.get("fixture_id") for e in normal_events if e.get("phase") == "setup"}
+        test_delta = set(setup_meta.get("test_ids", [])) ^ set(normal_meta.get("test_ids", []))
+        fixture_delta = setup_fixtures ^ normal_fixtures
+        result["setup_only_discordance"] = {
+            "test_id_symmetric_difference": sorted(test_delta),
+            "test_id_discordance_rate": len(test_delta) / max(
+                1, len(set(setup_meta.get("test_ids", [])) | set(normal_meta.get("test_ids", [])))
+            ),
+            "fixture_setup_symmetric_difference": sorted(fixture_delta),
+            "fixture_setup_discordance_rate": len(fixture_delta) / max(1, len(setup_fixtures | normal_fixtures)),
+            "setup_only_teardown_failures": sum(
+                e.get("phase") == "teardown" and e.get("status") == "failed" for e in setup_events
+            ),
+            "normal_teardown_failures": sum(
+                e.get("phase") == "teardown" and e.get("status") == "failed" for e in normal_events
+            ),
+        }
+
+    events = [
+        event for run_record in result["execution_runs"]
+        for event in run_record["metadata"].get("fixture_events", [])
+    ]
+    result["fixture_repetition_summary"] = summarize_fixture_repetitions(events)
+    result["test_to_fixtures"] = result["execution_runs"][0]["metadata"].get("test_to_fixtures", {})
+    result["pytest_run_classification"] = (
+        "completed_with_test_or_collection_failures"
+        if any(run["run"].get("returncode") == 1 for run in result["execution_runs"])
+        else "completed_without_pytest_failures"
+    )
+    result["status"] = "pilot_project_complete"
+    return result
+
+
+def summarize_pilot(record: dict[str, Any]) -> dict[str, Any]:
+    projects = record.get("projects", [])
+    completed = [row for row in projects if row.get("status") == "pilot_project_complete"]
+    error_catalog: dict[str, dict[str, Any]] = {}
+    setup_discordance = []
+    breaker_comparisons = []
+    for project in completed:
+        events = [
+            event for run_record in project.get("execution_runs", [])
+            for event in run_record.get("metadata", {}).get("fixture_events", [])
+        ]
+        failures = project.get("fixture_errors", []) or [event for event in events if event.get("status") == "failed"]
+        for event in failures:
+            key = str(event.get("signature") or f"{event.get('exception_class')}|{event.get('message')}")
+            entry = error_catalog.setdefault(key, {
+                "signature": key, "exception_class": event.get("exception_class"),
+                "message": event.get("message"), "innermost_frame": event.get("innermost_frame"),
+                "project_ids": [], "occurrences": 0,
+            })
+            entry["occurrences"] += int(event.get("occurrences", 1))
+            if project.get("project_id") not in entry["project_ids"]:
+                entry["project_ids"].append(project.get("project_id"))
+        if project.get("setup_only_discordance") is not None:
+            setup_discordance.append(project["setup_only_discordance"])
+        if project.get("circuit_breaker_comparison") is not None:
+            breaker_comparisons.append(project["circuit_breaker_comparison"])
+    statuses = [row.get("status") for row in projects]
+    return {
+        "projects_total": len(projects),
+        "funnel": {
+            "clone_succeeded": sum(bool(row.get("clone", {}).get("returncode") == 0) for row in projects),
+            "dependencies_installed": sum(bool(row.get("dependency_installation", {}).get("ready")) for row in projects),
+            "stable_collection": sum(row.get("collection_ids_stable") is True for row in projects),
+            "collection_viable_at_provisional_fraction": sum(row.get("collection_viable") is True for row in projects),
+            "setup_plan_available": sum(
+                bool(row.get("setup_plan_test_ids") or row.get("setup_plan_summary", {}).get("test_count"))
+                for row in projects
+            ),
+            "normal_executions_completed_twice": sum(
+                len(row.get("execution_runs", [])) == 2
+                and all(run.get("completion", "completed") == "completed"
+                        for run in row.get("execution_runs", []))
+                for row in projects
+            ),
+            "pilot_projects_complete": len(completed),
+            "projects_with_python_fallback": sum(
+                len(row.get("python_candidate_attempts", [])) > 1 for row in projects
+            ),
+            "python_candidates_attempted": sum(
+                len(row.get("python_candidate_attempts", [])) for row in projects
+            ),
+        },
+        "status_counts": {status: statuses.count(status) for status in sorted(set(statuses))},
+        "setup_only_comparison": {
+            "projects": len(setup_discordance),
+            "test_id_discordance_rate_mean": (
+                sum(item.get("test_id_discordance_rate", 0.0) for item in setup_discordance)
+                / len(setup_discordance) if setup_discordance else None
+            ),
+            "fixture_setup_discordance_rate_mean": (
+                sum(item.get("fixture_setup_discordance_rate", 0.0) for item in setup_discordance)
+                / len(setup_discordance) if setup_discordance else None
+            ),
+            "details": setup_discordance,
+        },
+        "circuit_breaker_k3": {
+            "projects": len(breaker_comparisons),
+            "total_aborted_items": sum(item.get("aborted_test_count", 0) for item in breaker_comparisons),
+            "total_elapsed_seconds_delta": round(
+                sum(item.get("elapsed_seconds_delta", 0.0) for item in breaker_comparisons), 3
+            ),
+            "details": breaker_comparisons,
+        },
+        "error_catalog": sorted(error_catalog.values(), key=lambda item: (-item["occurrences"], item["signature"])),
+        "x_threshold": "not_calculated_in_pilot",
+        "minimum_usable_fixtures": "reserved_for_preregistration_v2",
+    }
+
+
+def tooling_fingerprint(configuration: dict[str, Any] | None = None) -> str:
+    digest = __import__("hashlib").sha256()
+    for path in (Path(__file__), ROOT / "scripts" / "phase1_probe.py",
+                 ROOT / "scripts" / "phase1_catalog.py", RUNNER):
+        digest.update(path.name.encode("utf-8"))
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"missing")
+    digest.update(json.dumps(configuration or {}, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return digest.hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", type=Path, default=SAMPLE)
     parser.add_argument("--project-id", help="ID de um projeto da amostra; padrão: primeiro")
+    parser.add_argument("--pilot", action="store_true",
+                        help="executa todos os projetos da amostra (sem esta opção, executa só o primeiro)")
+    parser.add_argument("--comparison-projects", type=int, default=6,
+                        help="quantidade de projetos iniciais da amostra para comparar setup-only/normal")
     parser.add_argument("--install-smoke-only", action="store_true",
                         help="instala somente o projeto selecionado e preserva clone/.venv_ready")
+    parser.add_argument("--reuse-source", type=Path,
+                        help="reutiliza um clone existente com .venv_ready; exige --project-id e SHA idêntico")
     parser.add_argument("--isolation-launcher-json")
     parser.add_argument("--python", default=sys.executable,
                         help="Python base; padrão: interpretador que executa este launcher")
+    parser.add_argument("--python-candidates", default="3.13,3.12,3.11",
+                        help="ordem determinística de versões tentadas no piloto (máximo de três)")
     parser.add_argument("--run-uid", type=int, default=os.geteuid(),
                         help="UID dedicado; padrão: UID efetivo atual")
     parser.add_argument("--run-gid", type=int, default=os.getegid(),
@@ -351,6 +993,8 @@ def main() -> int:
                         default=Path("/var/tmp") / f"phase1-python-{os.geteuid()}",
                         help="Destino persistente para Pythons gerenciados pelo uv")
     parser.add_argument("--timeout-per-test", type=int, default=120)
+    parser.add_argument("--collection-min-fraction", type=float, default=0.5,
+                        help="limiar provisório de viabilidade para o piloto; será congelado na v2")
     parser.add_argument("--clone-timeout", type=int, default=600)
     parser.add_argument("--install-timeout", type=int, default=1200,
                         help="limite por tentativa de dependências; padrão do pré-registro: 20 minutos")
@@ -387,8 +1031,17 @@ def main() -> int:
         executable = Path(launcher[0])
         if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
             parser.error("o primeiro argumento do launcher deve ser um executável absoluto")
-    if args.timeout_per_test <= 0 or args.clone_timeout <= 0 or args.install_timeout <= 0 or args.max_repo_bytes <= 0:
+    if (args.timeout_per_test <= 0 or args.clone_timeout <= 0 or args.install_timeout <= 0
+            or args.max_repo_bytes <= 0 or args.comparison_projects < 0
+            or not 0 < args.collection_min_fraction <= 1):
         parser.error("timeouts e limite do clone devem ser positivos")
+    if args.pilot and args.install_smoke_only:
+        parser.error("--pilot e --install-smoke-only são modos distintos")
+    if args.reuse_source and (not args.project_id or args.pilot or args.install_smoke_only):
+        parser.error("--reuse-source exige --project-id e não combina com --pilot/--install-smoke-only")
+    python_candidates = [value.strip() for value in args.python_candidates.split(",") if value.strip()]
+    if not python_candidates or len(python_candidates) > 3 or len(set(python_candidates)) != len(python_candidates):
+        parser.error("--python-candidates deve listar de uma a três versões únicas")
 
     try:
         projects = load_sample(args.sample.resolve())
@@ -398,7 +1051,7 @@ def main() -> int:
         projects = [p for p in projects if p["project_id"] == args.project_id]
         if not projects:
             parser.error(f"projeto não encontrado na amostra: {args.project_id}")
-    else:
+    elif not args.pilot:
         projects = projects[:1]
 
     artifacts = args.artifacts.resolve()
@@ -415,23 +1068,40 @@ def main() -> int:
         preflight = (
             {"passed": None, "status": "not_run_network_enabled_install_only"}
             if args.install_smoke_only
-            else validate_isolation(args, temp_root, env)
+            else {"passed": None, "status": "deferred_until_project_environment_is_ready"}
         )
         record: dict[str, Any] = {
             "created_at_epoch": int(time.time()),
             "sample": str(args.sample.resolve()),
             "uv_python_install_dir": env["UV_PYTHON_INSTALL_DIR"],
             "isolation_preflight": preflight,
+            "mode": "install_smoke" if args.install_smoke_only else ("pilot" if args.pilot else "single_project"),
+            "tooling_fingerprint": "",
             "projects": [],
         }
-        if not args.install_smoke_only and not preflight["passed"]:
-            record["status"] = "blocked_isolation_controls_failed"
-            (artifacts / "dynamic_launcher_smoke.json").write_text(
-                json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            print(json.dumps(record, indent=2, ensure_ascii=False))
-            return 2
-
+        # Freeze the comparison cohort before running any project tests.
+        comparison_ids = (
+            {args.project_id} if args.project_id and not args.install_smoke_only
+            else {row["project_id"] for row in projects[:min(args.comparison_projects, len(projects))]}
+        )
+        comparison_record = {
+            "schema_version": 1,
+            "selection_rule": "first N projects in the committed sample order",
+            "count": len(comparison_ids),
+            "project_ids": [row["project_id"] for row in projects if row["project_id"] in comparison_ids],
+            "created_at_epoch": int(time.time()),
+        }
+        sample_bytes = args.sample.resolve().read_bytes()
+        record["tooling_fingerprint"] = tooling_fingerprint({
+            "sample_sha256": __import__("hashlib").sha256(sample_bytes).hexdigest(),
+            "python_candidates": python_candidates,
+            "collection_min_fraction": args.collection_min_fraction,
+            "comparison_project_ids": comparison_record["project_ids"],
+            "isolation_launcher": launcher,
+            "timeout_per_test": args.timeout_per_test,
+        })
+        if not args.install_smoke_only:
+            _write_json(artifacts / "setup_only_comparison_cohort.json", comparison_record)
         for project in projects:
             pid, sha, url = project["project_id"], project["commit_sha"], project["url"]
             if args.install_smoke_only:
@@ -441,8 +1111,20 @@ def main() -> int:
                 repo = persistent_run / "source"
                 uv_cache_root = persistent_run / "uv-cache"
             else:
-                repo = temp_root / f"repo-{pid}"
-                uv_cache_root = temp_root / "uv-cache"
+                project_root = artifacts / "pilot" / pid / sha
+                project_root.mkdir(parents=True, exist_ok=True)
+                repo = args.reuse_source.resolve() if args.reuse_source else project_root / "source"
+                uv_cache_root = args.uv_cache_dir.resolve()
+                project_dir = project_root / "results"
+                saved_project = _read_project_checkpoint(project_dir)
+                if (saved_project.get("status") == "pilot_project_complete"
+                        and saved_project.get("commit_sha") == sha
+                        and saved_project.get("tooling_fingerprint") == record["tooling_fingerprint"]):
+                    saved_project["resumed_from_checkpoint"] = True
+                    record["projects"].append(saved_project)
+                    record["status"] = "pilot_in_progress"
+                    _write_json(artifacts / "pilot_progress.json", _progress_manifest(record))
+                    continue
             project_record: dict[str, Any] = {
                 "project_id": pid, "commit_sha": sha, "url": redact(url),
                 "persistent_project_path": str(repo) if args.install_smoke_only else None,
@@ -466,13 +1148,19 @@ def main() -> int:
                     print(json.dumps(record, indent=2, ensure_ascii=False))
                     return 2
                 continue
-            clone = run(["git", "clone", "--quiet", "--no-tags", url, str(repo)],
-                        cwd=temp_root, env=env, timeout=args.clone_timeout)
-            project_record["clone"] = clone
-            if clone["returncode"] != 0 or clone["timed_out"]:
-                project_record["status"] = "clone_failed"
-                record["projects"].append(project_record)
-                continue
+            if not repo.exists():
+                clone = run(["git", "clone", "--quiet", "--no-tags", url, str(repo)],
+                            cwd=temp_root, env=env, timeout=args.clone_timeout)
+                project_record["clone"] = clone
+                if clone["returncode"] != 0 or clone["timed_out"]:
+                    project_record["status"] = "clone_failed"
+                    record["projects"].append(project_record)
+                    continue
+            else:
+                project_record["clone"] = {
+                    "returncode": 0, "timed_out": False,
+                    "status": "reused_existing_checkout",
+                }
             checkout = run(["git", "checkout", "--quiet", "--detach", sha],
                            cwd=repo, env=env, timeout=120)
             project_record["checkout"] = checkout
@@ -480,60 +1168,131 @@ def main() -> int:
                 project_record["status"] = "checkout_failed"
                 record["projects"].append(project_record)
                 continue
-            size = sum(p.stat().st_size for p in repo.rglob("*") if p.is_file() and ".git" not in p.parts)
+            size = repository_working_tree_bytes(repo)
             project_record["working_tree_bytes"] = size
             if size > args.max_repo_bytes:
                 project_record["status"] = "repo_size_limit_exceeded"
                 record["projects"].append(project_record)
                 continue
 
-            installation = install_project_dependencies(
-                repo,
-                project_id=pid,
-                python=args.python,
-                uv=uv,
-                base_env=env,
-                timeout=args.install_timeout,
-                cache_root=(args.uv_cache_dir.resolve()
-                            if args.install_smoke_only else uv_cache_root),
-            )
+            ready_python = repo / ".venv_ready" / "bin" / "python"
+            candidate_attempts: list[dict[str, Any]] = []
+            if ready_python.is_file():
+                check = run([str(ready_python), "-c", "import pytest; print(pytest.__version__)"],
+                            cwd=repo, env=env, timeout=30)
+                installation = {
+                    "ready": check["returncode"] == 0,
+                    "status": "reused" if check["returncode"] == 0 else "stale_ready_environment",
+                    "python": str(ready_python), "post_promotion_check": check,
+                }
+                if check["returncode"] != 0:
+                    project_record["status"] = "stale_ready_environment"
+                    project_record["dependency_installation"] = installation
+                    record["projects"].append(project_record)
+                    continue
+                if args.install_smoke_only:
+                    project_record["status"] = "installation_smoke_passed"
+                    project_record["dependency_installation"] = installation
+                    record["projects"].append(project_record)
+                    continue
+                project_result = _process_pilot_project(
+                    args, project=project, repo=repo, python=installation["python"],
+                    temp_root=temp_root, base_env=env, launcher=launcher,
+                    project_dir=project_dir, comparison_ids=comparison_ids,
+                    run_prefix="reused",
+                )
+                project_record.update(installation=installation, **project_result)
+                project_record["python_candidate_attempts"] = [{
+                    "candidate": "reused_ready_environment",
+                    "status": project_result.get("status"),
+                    "collection_fraction": project_result.get("collection_fraction"),
+                }]
+            else:
+                candidates = [args.python] if args.install_smoke_only else python_candidates
+                project_result = None
+                installation = {"ready": False, "status": "all_python_candidates_failed"}
+                for candidate_index, candidate in enumerate(candidates, start=1):
+                    attempt = install_project_dependencies(
+                        repo,
+                        project_id=pid,
+                        python=args.python,
+                        python_request_override=(None if args.install_smoke_only else candidate),
+                        uv=uv,
+                        base_env=env,
+                        timeout=args.install_timeout,
+                        cache_root=(args.uv_cache_dir.resolve()
+                                    if args.install_smoke_only else uv_cache_root),
+                    )
+                    candidate_record: dict[str, Any] = {
+                        "candidate_order": candidate_index,
+                        "python_request": candidate,
+                        "installation": attempt,
+                    }
+                    candidate_attempts.append(candidate_record)
+                    installation = attempt
+                    if not attempt["ready"]:
+                        continue
+                    if args.install_smoke_only:
+                        break
+                    candidate_result = _process_pilot_project(
+                        args, project=project, repo=repo, python=attempt["python"],
+                        temp_root=temp_root, base_env=env, launcher=launcher,
+                        project_dir=project_dir, comparison_ids=comparison_ids,
+                        run_prefix=f"python-{re.sub(r'[^A-Za-z0-9_.-]', '_', candidate)}",
+                    )
+                    candidate_record["collection_fraction"] = candidate_result.get("collection_fraction")
+                    candidate_record["status"] = candidate_result.get("status")
+                    candidate_record["collection_runs"] = candidate_result.get("collection_runs", [])
+                    candidate_record["collection_errors"] = candidate_result.get("collection_errors", [])
+                    project_result = candidate_result
+                    if candidate_result.get("status") == "collection_below_provisional_fraction_threshold":
+                        remove_ready_venv(repo, repo / ".venv_ready")
+                        if candidate_index == len(candidates):
+                            candidate_result["status"] = "collection_unviable_for_all_python_candidates"
+                            project_result = candidate_result
+                        continue
+                    # Unstable collection or isolation failure is recorded; do not
+                    # select a later interpreter based on fixture success.
+                    break
+                project_record["python_candidate_attempts"] = candidate_attempts
+
             project_record["dependency_installation"] = installation
-            if not installation["ready"]:
+            if not installation.get("ready"):
+                if project_result and project_result.get("status") == "collection_below_provisional_fraction_threshold":
+                    project_result["status"] = "collection_unviable_for_all_python_candidates"
+                    project_record.update(project_result)
+                    project_record["python_candidate_attempts"] = candidate_attempts
+                    project_record["tooling_fingerprint"] = record["tooling_fingerprint"]
+                    compact_project = _compact_project_record(
+                        project_record, project_dir / "project_result.json"
+                    )
+                    record["projects"].append(compact_project)
+                    _write_json(project_dir / "project_result.json", compact_project)
+                    _write_json(project_dir / "project_checkpoint.json", compact_project)
+                    continue
                 project_record["status"] = "dependency_unresolvable"
                 record["projects"].append(project_record)
                 continue
-
             if args.install_smoke_only:
                 project_record["status"] = "installation_smoke_passed"
                 record["projects"].append(project_record)
                 continue
-
-            output = artifacts / f"{pid}-setup-plan.json"
-            isolated_env = dict(env)
-            isolated_env.update({
-                "PHASE1_PROJECT_ID": pid,
-                "PHASE1_PROJECT_ROOT": str(repo.resolve()),
-                "PHASE1_RUN_ID": f"smoke-{pid}",
-                "PHASE1_OUTPUT": str(output),
-                "PYTHONPATH": str(ROOT / "scripts"),
-                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-            })
-            pytest_args = [
-                installation["python"], "-m", "pytest", "--continue-on-collection-errors",
-                "--setup-plan", "-p", "phase1_probe", "-q",
-            ]
-            execution = run([*launcher, "--", *pytest_args], cwd=repo,
-                            env=isolated_env, timeout=30 * 60)
-            project_record["setup_plan"] = execution
-            project_record["probe_artifact"] = str(output)
-            try:
-                metadata = json.loads(output.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                metadata = {}
-            project_record["collected_item_count"] = len(metadata.get("test_ids", []))
-            project_record["collection_errors"] = metadata.get("collection_errors", [])
-            project_record["status"] = "setup_plan_complete" if execution["returncode"] == 0 else "setup_plan_failed"
-            record["projects"].append(project_record)
+            if project_result is None:
+                project_record["status"] = "collection_unviable_for_all_python_candidates"
+                record["projects"].append(project_record)
+                continue
+            project_record.update(project_result)
+            project_record["tooling_fingerprint"] = record["tooling_fingerprint"]
+            compact_project = _compact_project_record(
+                project_record, project_dir / "project_result.json"
+            )
+            record["projects"].append(compact_project)
+            _write_json(project_dir / "project_result.json", compact_project)
+            _write_json(project_dir / "project_checkpoint.json", compact_project)
+            # Checkpoint after every project so an interrupted batch is resumable.
+            record["status"] = "pilot_in_progress"
+            record["projects"][-1] = compact_project
+            _write_json(artifacts / "pilot_progress.json", _progress_manifest(record))
 
         if args.install_smoke_only:
             project_result = record["projects"][0] if record["projects"] else {}
@@ -541,14 +1300,28 @@ def main() -> int:
             record["status"] = "installation_smoke_passed" if passed else "installation_smoke_failed"
             report_path = artifacts / f"install_smoke_{projects[0]['project_id']}.json"
         else:
-            record["status"] = "smoke_complete"
-            report_path = artifacts / "dynamic_launcher_smoke.json"
-        report_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(json.dumps(record, indent=2, ensure_ascii=False))
+            statuses = {item.get("status") for item in record["projects"]}
+            record["status"] = (
+                "pilot_complete" if args.pilot and statuses == {"pilot_project_complete"}
+                else "single_project_complete" if not args.pilot and statuses == {"pilot_project_complete"}
+                else "pilot_incomplete"
+            )
+            record["setup_only_comparison_cohort"] = comparison_record
+            record["pilot_summary"] = summarize_pilot(record)
+            report_path = artifacts / ("pilot_report.json" if args.pilot else "single_project_report.json")
+        _write_json(report_path, record)
+        print(json.dumps({
+            "status": record.get("status"),
+            "projects_total": len(record.get("projects", [])),
+            "pilot_summary": record.get("pilot_summary"),
+            "report": str(report_path),
+        }, indent=2, ensure_ascii=False))
         if args.install_smoke_only and passed:
             print(f"Ambiente persistido em: {project_result['dependency_installation']['python']}")
         print(f"Relatório salvo em: {report_path}")
-    return 0 if not args.install_smoke_only or passed else 2
+    if args.install_smoke_only:
+        return 0 if passed else 2
+    return 0 if record.get("status") in {"pilot_complete", "single_project_complete"} else 2
 
 
 if __name__ == "__main__":

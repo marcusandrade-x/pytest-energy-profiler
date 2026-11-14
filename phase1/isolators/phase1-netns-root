@@ -21,7 +21,7 @@ while [[ "$#" -gt 0 && "$1" != "--" ]]; do
   name="${assignment%%=*}"
   [[ "$assignment" == *=* ]] || die "malformed environment assignment"
   case "$name" in
-    PATH|HOME|TMPDIR|LANG|LC_ALL|PYTHONPATH|PYTHONUNBUFFERED|PHASE1_PROJECT_ID|PHASE1_PROJECT_ROOT|PHASE1_RUN_ID|PHASE1_OUTPUT)
+    PATH|HOME|TMPDIR|LANG|LC_ALL|PYTHONPATH|PYTHONUNBUFFERED|PHASE1_PROJECT_ID|PHASE1_PROJECT_ROOT|PHASE1_RUN_ID|PHASE1_OUTPUT|PHASE1_STATIC_INVENTORY|PHASE1_PRIOR_DEPENDENCY_MAP|PHASE1_CIRCUIT_BREAKER_K)
       env_args+=("$assignment")
       ;;
     *) die "environment variable is not allowlisted: $name" ;;

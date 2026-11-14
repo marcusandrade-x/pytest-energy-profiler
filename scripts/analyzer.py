@@ -25,9 +25,10 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-DIRETORIO_REPOS = Path("./repositorios_temp")
-ARQUIVO_URLS = Path("candidates.txt")
-ARQUIVO_CSV = Path("mine_projects.csv")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DIRETORIO_REPOS = PROJECT_ROOT / "repositorios_temp"
+ARQUIVO_URLS = PROJECT_ROOT / "input_data" / "candidates.txt"
+ARQUIVO_CSV = PROJECT_ROOT / "input_data" / "mined_projects.csv"
 CABECALHO_CSV = [
     "project_name", "descricao", "url", "num_tests", "num_fixtures",
     "loc_tests", "arquivos_tests", "loc_producao", "arquivos_producao",

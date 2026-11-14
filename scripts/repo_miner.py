@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # Constantes da API e Regras de Negócio
 GITHUB_API = "https://api.github.com"
 API_VERSION = "2026-03-10"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 PADRAO_DEPENDENCIA_LINHA = re.compile(r"^pytest\s*([\[=<>~!@].*)?$")
 PADRAO_PYTEST_PALAVRA = re.compile(r"\bpytest\b")
@@ -322,7 +323,11 @@ def main():
     parser.add_argument("--start-page", type=int, default=1, help="Página inicial na API do GitHub. Default: 1.")
     parser.add_argument("--pages", type=int, default=5, help="Quantidade de páginas para buscar a partir do start-page. Default: 5.")
 
-    parser.add_argument("--output", default="results/github_pytest_search.csv", help="Caminho do arquivo CSV de saída.")
+    parser.add_argument(
+        "--output",
+        default=str(PROJECT_ROOT / "input_data" / "github_pytest_search.csv"),
+        help="CSV de repositórios descobertos (caminho relativo ao diretório atual ou absoluto).",
+    )
     args = parser.parse_args()
 
     client = GitHubClient(args.token)

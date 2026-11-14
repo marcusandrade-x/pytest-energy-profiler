@@ -1,0 +1,10 @@
+# Python tooling and energy profiler dependencies for Python 3.11+.
+# Project-under-study dependencies are installed separately by the Phase 1 launcher.
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+pytest>=7.4,<10
+pytest-timeout>=2.2,<3
+pytest-asyncio>=0.23,<2
+pytest-json-report>=1.5,<2
+codecarbon>=2.5,<4
+uv>=0.7,<1

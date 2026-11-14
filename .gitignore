@@ -3,6 +3,8 @@
 # ==========================================
 venv/
 .venv/
+.venv_*/
+.venv_ready/
 .env
 
 # ==========================================
@@ -17,6 +19,11 @@ __pycache__/
 # Áreas de trabalho do orquestrador e saídas
 # ==========================================
 workspace/
+/phase1/artifacts/
+/phase1/results/
+/phase1/logs/
+/artifacts/
+# JSON is not ignored globally: reviewed compact result summaries may be versioned.
 ws_smoke/
 ws_sweep/
 energia_ws/

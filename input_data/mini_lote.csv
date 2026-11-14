@@ -1,0 +1,3 @@
+project_name,descricao,url,num_tests,num_fixtures,loc_tests,arquivos_tests,loc_producao,arquivos_producao,loc_projeto_total,motivo_exclusao
+agents-livekit,A framework for building realtime voice AI agents 🤖🎙️📹 ,https://github.com/livekit/agents,3677,69,64951,264,133528,739,198479,
+agents-wshobson,Sem descrição,https://github.com/wshobson/agents,467,8,5761,25,7263,38,13024,
