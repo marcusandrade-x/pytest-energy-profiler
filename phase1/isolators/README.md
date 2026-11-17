@@ -92,8 +92,11 @@ timeout de 20 minutos. A ordem é `.[test]`, `.`, `requirements-test.txt`,
 presentes. Após instalar o projeto, instala as ferramentas de coleta; a primeira
 tentativa completa é renomeada para `.venv_ready`. Tentativas malsucedidas são
 classificadas no JSON e seus ambientes descartados. Para respeitar projetos com
-restrição de Python, o launcher usa `project.requires-python` ou
-`.python-version` antes do Python informado como fallback. Pythons gerenciados
+restrição de Python, o launcher lê `project.requires-python`, a restrição do
+Poetry, `setup.cfg:options.python_requires` ou `.python-version`, e filtra
+candidatos incompatíveis antes de instalar. Sintaxe desconhecida não elimina
+candidatos: eles continuam para que o resolvedor do `uv` decida. O relatório
+registra a restrição, sua origem e os candidatos ignorados. Pythons gerenciados
 ficam em `/var/tmp/phase1-python-<uid>` por padrão, separado do `HOME` temporário
 para que `.venv_ready` continue executável após o smoke. Download, build e
 instalação do `uv` ficam serializados para reduzir o pico de memória. O cache e

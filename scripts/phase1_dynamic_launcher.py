@@ -10,6 +10,7 @@ preselected subset the setup-only comparison and K=3 circuit-breaker run.
 from __future__ import annotations
 
 import argparse
+import configparser
 import csv
 import grp
 import json
@@ -46,6 +47,32 @@ SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$")
 URL_CREDENTIALS_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
 URL_QUERY_SECRET_RE = re.compile(r"(?i)([?&](?:token|access_token|password|key)=)[^&\s]+")
+TEST_DEPENDENCY_TOKENS = {
+    "test", "tests", "testing", "unittest", "integration", "qa", "ci",
+    "dev", "develop", "development",
+}
+TEST_REQUIREMENT_FILES = (
+    "requirements-test.txt", "requirements_test.txt", "requirements-tests.txt",
+    "test-requirements.txt", "test_requirements.txt", "dev-requirements.txt",
+    "requirements-dev.txt", "requirements_dev.txt",
+    "requirements/test.txt", "requirements/tests.txt", "requirements/testing.txt",
+    "requirements/dev.txt", "requirements/ci.txt",
+)
+REQUIREMENT_INCLUDE_RE = re.compile(r"(test|dev|ci|qa|integration)", re.IGNORECASE)
+REQUIREMENT_EXCLUDE_RE = re.compile(
+    r"(doc|lint|typing|mypy|build|release|style|format|bench|audit|"
+    r"pre-?commit|publish)", re.IGNORECASE,
+)
+COMPLETED_PROJECT_STATUSES = {
+    "pilot_project_complete",
+    "pilot_project_complete_with_collection_errors",
+    "pilot_project_complete_with_test_failures",
+}
+TERMINAL_PILOT_STATUSES = COMPLETED_PROJECT_STATUSES | {
+    "dependency_unresolvable",
+    "no_compatible_python_candidate",
+    "collection_unviable_for_all_python_candidates",
+}
 
 
 def run(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int) -> dict[str, Any]:
@@ -133,18 +160,146 @@ def redact(value: str) -> str:
     return URL_QUERY_SECRET_RE.sub(r"\1<redacted>", value)
 
 
+def _preferred_test_dependency_names(names: Any) -> list[str]:
+    """Select declared dependency profiles with test, CI, or development intent."""
+    selected: list[str] = []
+    for name in names:
+        tokens = set(re.split(r"[-_.]+", str(name).lower()))
+        if tokens & TEST_DEPENDENCY_TOKENS:
+            selected.append(str(name))
+    priority = {
+        "test": 0, "tests": 1, "testing": 2, "unittest": 3,
+        "integration": 4, "qa": 5, "ci": 6,
+        "dev": 7, "develop": 8, "development": 9,
+    }
+    return sorted(dict.fromkeys(selected), key=lambda name: (
+        min((priority.get(token, 20) for token in re.split(r"[-_.]+", name.lower())), default=20),
+        name.lower(),
+    ))
+
+
+def _test_requirement_files(repo: Path) -> list[str]:
+    """Find conventional and named test/development requirement files."""
+    candidates = list(TEST_REQUIREMENT_FILES)
+    for pattern in ("*requirements*.txt", "requirements/*.txt", "reqs/*.txt", "ci/*.txt"):
+        candidates.extend(
+            path.relative_to(repo).as_posix()
+            for path in sorted(repo.glob(pattern)) if path.is_file()
+        )
+    selected: list[str] = []
+    for filename in candidates:
+        path = repo / filename
+        if (filename in TEST_REQUIREMENT_FILES and path.is_file()) or (
+            path.is_file() and REQUIREMENT_INCLUDE_RE.search(path.name)
+            and not REQUIREMENT_EXCLUDE_RE.search(path.name)
+        ):
+            if filename not in selected:
+                selected.append(filename)
+    return selected[:8]
+
+
 def installation_strategies(repo: Path) -> list[tuple[str, list[str]]]:
-    """Return ordered, manifest-backed installation attempts."""
+    """Return ordered, manifest-backed dependency profiles with fallbacks."""
     strategies: list[tuple[str, list[str]]] = []
-    if (repo / "pyproject.toml").is_file() or (repo / "setup.py").is_file():
-        strategies.extend([
-            ("editable_test_extra", ["pip", "install", "--editable", ".[test]"]),
-            ("editable_project", ["pip", "install", "--editable", "."]),
-        ])
-    for filename in ("requirements-test.txt", "requirements-dev.txt", "requirements.txt"):
-        if (repo / filename).is_file():
-            strategies.append((f"{filename}", ["pip", "install", "--requirement", filename]))
-    return strategies
+    pyproject = repo / "pyproject.toml"
+    editable_project = pyproject.is_file() or (repo / "setup.py").is_file() or (repo / "setup.cfg").is_file()
+    requirement_files = _test_requirement_files(repo)
+    if pyproject.is_file():
+        try:
+            manifest = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            manifest = {}
+
+        project = manifest.get("project", {})
+        if not isinstance(project, dict):
+            project = {}
+        extras = project.get("optional-dependencies", {})
+        poetry = (manifest.get("tool", {}).get("poetry", {}) or {})
+        if isinstance(poetry, dict):
+            extras = {**(extras if isinstance(extras, dict) else {}),
+                      **(poetry.get("extras", {}) or {})}
+        setup_cfg = repo / "setup.cfg"
+        if setup_cfg.is_file():
+            parser = configparser.ConfigParser(interpolation=None)
+            try:
+                parser.read(setup_cfg, encoding="utf-8")
+                if parser.has_section("options.extras_require"):
+                    extras = {**(extras if isinstance(extras, dict) else {}),
+                              **dict(parser.items("options.extras_require"))}
+            except configparser.Error:
+                pass
+        if not isinstance(extras, dict):
+            extras = {}
+        extra_names = _preferred_test_dependency_names(extras)
+        groups = manifest.get("dependency-groups", {})
+        group_names = _preferred_test_dependency_names(groups) if isinstance(groups, dict) else []
+        if extra_names or group_names:
+            profile_args = ["pip", "install"]
+            if group_names:
+                profile_args.extend(["--project", str(repo)])
+                for name in group_names:
+                    profile_args.extend(["--group", name])
+            for filename in requirement_files:
+                profile_args.extend(["--requirement", filename])
+            extra_spec = f".[{','.join(extra_names)}]" if extra_names else "."
+            profile_args.extend(["--editable", extra_spec])
+            strategies.append((
+                "editable_test_profiles",
+                profile_args,
+            ))
+        if extra_names:
+            # If the combined profile conflicts, fresh-venv narrower attempts
+            # below retain partial coverage.
+            strategies.append((
+                "editable_extras_" + "+".join(extra_names),
+                ["pip", "install", "--editable", f".[{','.join(extra_names)}]"],
+            ))
+            for name in extra_names:
+                strategies.append((
+                    f"editable_extra_{name}",
+                    ["pip", "install", "--editable", f".[{name}]"],
+                ))
+
+        if group_names:
+            group_args = ["pip", "install", "--project", str(repo)]
+            for name in group_names:
+                group_args.extend(["--group", name])
+            group_args.extend(["--editable", "."])
+            strategies.append(("editable_groups_" + "+".join(group_names), group_args))
+            for name in group_names:
+                strategies.append((
+                    f"editable_group_{name}",
+                    ["pip", "install", "--project", str(repo), "--group", name,
+                     "--editable", "."],
+                ))
+
+    if requirement_files:
+        all_args = ["pip", "install"]
+        for filename in requirement_files:
+            all_args.extend(["--requirement", filename])
+        if editable_project:
+            all_args.extend(["--editable", "."])
+        strategies.append(("requirements_" + "+".join(requirement_files), all_args))
+        for filename in requirement_files:
+            install_args = ["pip", "install", "--requirement", filename]
+            if editable_project:
+                install_args.extend(["--editable", "."])
+            strategies.append((f"requirements_{filename}", install_args))
+
+    if editable_project:
+        strategies.append(("editable_project", ["pip", "install", "--editable", "."]))
+    elif (repo / "requirements.txt").is_file():
+        strategies.append(("requirements.txt", ["pip", "install", "--requirement", "requirements.txt"]))
+
+    # Avoid retrying semantically identical commands when manifests overlap.
+    unique: list[tuple[str, list[str]]] = []
+    seen_commands: set[tuple[str, ...]] = set()
+    for name, command in strategies:
+        key = tuple(command)
+        if key not in seen_commands:
+            seen_commands.add(key)
+            unique.append((name, command))
+    return unique
 
 
 def classify_install_failure(result: dict[str, Any]) -> str:
@@ -198,19 +353,38 @@ def repository_working_tree_bytes(repo: Path) -> int:
     return total
 
 
-def project_python_request(repo: Path, fallback: str, override: str | None = None) -> str:
-    """Prefer the project's declared Python range over the host interpreter."""
-    if override:
-        return override
+def project_python_requirement(repo: Path) -> tuple[str | None, str | None]:
+    """Read the project's declared Python constraint and where it came from."""
     pyproject = repo / "pyproject.toml"
     if pyproject.is_file():
         try:
             data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, tomllib.TOMLDecodeError):
-            return fallback
-        requirement = data.get("project", {}).get("requires-python")
+            data = {}
+        project = data.get("project", {})
+        project = project if isinstance(project, dict) else {}
+        requirement = project.get("requires-python")
         if isinstance(requirement, str) and requirement.strip():
-            return requirement.strip()
+            return requirement.strip(), "pyproject.toml:project.requires-python"
+        tool = data.get("tool", {})
+        tool = tool if isinstance(tool, dict) else {}
+        poetry = tool.get("poetry", {})
+        poetry = poetry if isinstance(poetry, dict) else {}
+        poetry_dependencies = poetry.get("dependencies", {})
+        poetry_dependencies = poetry_dependencies if isinstance(poetry_dependencies, dict) else {}
+        poetry_python = poetry_dependencies.get("python")
+        if isinstance(poetry_python, str) and poetry_python.strip():
+            return poetry_python.strip(), "pyproject.toml:tool.poetry.dependencies.python"
+    setup_cfg = repo / "setup.cfg"
+    if setup_cfg.is_file():
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(setup_cfg, encoding="utf-8")
+            requirement = parser.get("options", "python_requires", fallback="").strip()
+        except (OSError, configparser.Error):
+            requirement = ""
+        if requirement:
+            return requirement, "setup.cfg:options.python_requires"
     version_file = repo / ".python-version"
     if version_file.is_file():
         try:
@@ -218,8 +392,90 @@ def project_python_request(repo: Path, fallback: str, override: str | None = Non
         except (OSError, UnicodeError):
             request = ""
         if request:
-            return request
-    return fallback
+            return request, ".python-version"
+    return None, None
+
+
+def python_request_satisfies(request: str, requirement: str) -> bool | None:
+    """Check a requested Python version against a PEP 440 constraint.
+
+    Return None when either value cannot be interpreted safely; unknown syntax
+    must not cause a compatible candidate to be discarded.
+    """
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?", request)
+    if not match:
+        return None
+    candidate = tuple(int(part or 0) for part in match.groups())
+    bare_version = re.fullmatch(r"\s*(\d+(?:\.\d+){0,2})\s*", requirement)
+    if bare_version:
+        parts = tuple(int(part) for part in bare_version.group(1).split("."))
+        return candidate[:len(parts)] == parts
+    poetry_range = re.fullmatch(r"\s*([~^])(\d+(?:\.\d+){0,2})\s*", requirement)
+    if poetry_range:
+        operator, version_text = poetry_range.groups()
+        parts = tuple(int(part) for part in version_text.split("."))
+        lower = parts + (0,) * (3 - len(parts))
+        if operator == "~":
+            upper = (lower[0], lower[1] + 1, 0)
+        elif lower[0] > 0:
+            upper = (lower[0] + 1, 0, 0)
+        elif lower[1] > 0:
+            upper = (0, lower[1] + 1, 0)
+        else:
+            upper = (0, 0, lower[2] + 1)
+        return candidate >= lower and candidate < upper
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        return Version(".".join(map(str, candidate))) in SpecifierSet(requirement)
+    except ImportError:
+        pass
+    except Exception:
+        return None
+
+    # Small stdlib fallback for the common PEP 440 comparison operators.
+    clauses = [item.strip() for item in requirement.split(",") if item.strip()]
+    if not clauses:
+        return None
+    for clause in clauses:
+        op_match = re.match(r"^(~=|===|==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+){0,2})(\.\*)?$", clause)
+        if not op_match:
+            return None
+        operator, version_text, wildcard = op_match.groups()
+        target_parts = tuple(int(part) for part in version_text.split("."))
+        target = target_parts + (0,) * (3 - len(target_parts))
+        if wildcard:
+            prefix_matches = candidate[:len(target_parts)] == target_parts
+            passed = prefix_matches if operator == "==" else not prefix_matches if operator == "!=" else None
+        elif operator == "~=":
+            upper = ((target[0] + 1, 0, 0) if len(target_parts) == 1
+                     else (target[0], target[1] + 1, 0) if len(target_parts) == 2
+                     else (target[0], target[1] + 1, 0))
+            passed = candidate >= target and candidate < upper
+        else:
+            passed = {
+                "===": candidate == target,
+                "==": candidate == target,
+                "!=": candidate != target,
+                "<=": candidate <= target,
+                ">=": candidate >= target,
+                "<": candidate < target,
+                ">": candidate > target,
+            }[operator]
+        if passed is None:
+            return None
+        if not passed:
+            return False
+    return True
+
+
+def project_python_request(repo: Path, fallback: str, override: str | None = None) -> str:
+    """Use an explicit candidate first, then project metadata, then fallback."""
+    if override:
+        return override
+    requirement, _source = project_python_requirement(repo)
+    return requirement or fallback
 
 
 def install_project_dependencies(
@@ -237,6 +493,12 @@ def install_project_dependencies(
     ready = repo / ".venv_ready"
     python_request = project_python_request(repo, python, python_request_override)
     result["python_request"] = python_request
+
+    def persist_attempts() -> None:
+        # Keep install failures inspectable after the compact project checkpoint
+        # drops the verbose candidate-attempt records.
+        _write_json(repo.parent / "results" / "installation_attempts.json", result)
+
     for index, (strategy_name, install_args) in enumerate(strategies, start=1):
         attempt = repo / f".venv_attempt_{index}"
         attempt_python = attempt / "bin" / "python"
@@ -257,6 +519,7 @@ def install_project_dependencies(
         if create["returncode"] != 0 or create["timed_out"] or not attempt_python.is_file():
             attempt_record["category"] = "venv_creation_error" if not create["timed_out"] else "timeout"
             result["attempts"].append(attempt_record)
+            persist_attempts()
             remove_attempt_venv(repo, attempt)
             continue
 
@@ -264,10 +527,15 @@ def install_project_dependencies(
                       cwd=repo, env=env, timeout=timeout)
         attempt_record["project_install"] = install
         if install["returncode"] == 0 and not install["timed_out"]:
+            # Resolve profiler-owned test tools outside the project's checkout.
+            # uv discovers project configuration from cwd; a project's private
+            # package index must not hide standard pytest plugins such as
+            # pytest-asyncio from this independent bootstrap step.
             tools = run([
                 uv, "pip", "install", "--python", str(attempt_python),
                 "pytest", "pytest-timeout", "pytest-asyncio", "pytest-json-report",
-            ], cwd=repo, env=env, timeout=timeout)
+                "pytest-forked", "pytest-cov", "pytest-xdist",
+            ], cwd=cache_root, env=env, timeout=timeout)
             attempt_record["test_tooling_install"] = tools
         else:
             tools = None
@@ -296,6 +564,7 @@ def install_project_dependencies(
             if promoted_check["returncode"] != 0:
                 attempt_record["category"] = "promoted_environment_not_usable"
                 result["attempts"].append(attempt_record)
+                persist_attempts()
                 remove_ready_venv(repo, ready)
                 continue
             attempt_record["category"] = "success"
@@ -306,6 +575,7 @@ def install_project_dependencies(
                 "successful_strategy": strategy_name,
                 "python": str(ready_python),
             })
+            persist_attempts()
             return result
 
         if install["returncode"] != 0 or install["timed_out"]:
@@ -317,9 +587,11 @@ def install_project_dependencies(
         else:
             attempt_record["category"] = "environment_setup_error"
         result["attempts"].append(attempt_record)
+        persist_attempts()
         remove_attempt_venv(repo, attempt)
 
     result.update({"status": "all_install_attempts_failed", "category": "dependency_unresolvable"})
+    persist_attempts()
     return result
 
 
@@ -457,8 +729,10 @@ def _compact_project_record(project: dict[str, Any], checkpoint: Path | None = N
             "ast_test_item_estimate", "unexpanded_parametrized_function_count",
             "dynamic_collection_hook_module_count", "collection_ratio_is_lower_bound",
             "collection_loss",
-            "collection_minimum_fraction", "setup_only_comparison_selected",
-            "fixture_repetition_summary", "incomplete_execution", "clone", "checkout",
+            "collection_minimum_fraction", "collection_error_count", "collection_status",
+            "pytest_run_classification", "setup_only_comparison_selected",
+            "fixture_repetition_summary", "incomplete_execution", "python_requirement",
+            "clone", "checkout",
         ) if key in project
     }
     if project.get("setup_only_discordance"):
@@ -489,7 +763,16 @@ def _compact_project_record(project: dict[str, Any], checkpoint: Path | None = N
             key: install.get(key) for key in ("ready", "status", "python", "successful_strategy")
         }
     compact["python_candidate_attempts"] = [
-        {key: item.get(key) for key in ("candidate_order", "python_request", "status", "collection_fraction")}
+        {
+            "candidate_order": item.get("candidate_order"),
+            "python_request": item.get("python_request"),
+            "attempted": item.get("attempted", True),
+            "status": item.get("status"),
+            "skip_reason": item.get("skip_reason"),
+            "installation_status": (item.get("installation") or {}).get("status"),
+            "installation_ready": (item.get("installation") or {}).get("ready"),
+            "collection_fraction": item.get("collection_fraction"),
+        }
         for item in project.get("python_candidate_attempts", [])
     ]
     compact["collection_runs"] = [
@@ -591,7 +874,9 @@ def _isolated_pytest(args: argparse.Namespace, *, temp_root: Path,
                "-p", "no:cacheprovider", "-p", "no:randomly",
                "-p", "no:random_order", "-p", "no:pytest_random_order",
                "--timeout", str(args.timeout_per_test), "--timeout-method=signal",
-               "-p", "phase1_probe", "-q"]
+               "-p", "phase1_probe", "-q", "-n", "0",
+               "-W",
+               'ignore:The configuration option "asyncio_default_fixture_loop_scope" is unset:pytest.PytestDeprecationWarning']
     if mode == "collect-only":
         command += ["--collect-only"]
     elif mode == "setup-plan":
@@ -603,10 +888,24 @@ def _isolated_pytest(args: argparse.Namespace, *, temp_root: Path,
     command.extend(f"--deselect={nodeid}" for nodeid in (deselect or []))
     result = run([*launcher, "--", *command], cwd=repo,
                  env=env, timeout=timeout)
+    result["output_log_files"] = _persist_phase_output(artifact_dir, run_id, result)
     metadata = _read_json(output)
     result["isolation_preflight"] = preflight
     result["probe_artifact"] = str(output)
     return result, metadata
+
+
+def _persist_phase_output(artifact_dir: Path, run_id: str,
+                          result: dict[str, Any]) -> dict[str, str]:
+    """Keep the bounded, redacted subprocess output after compacting checkpoints."""
+    log_dir = artifact_dir / "command-output"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+    for stream in ("stdout", "stderr"):
+        path = log_dir / f"{run_id}.{stream}.txt"
+        path.write_text(str(result.get(stream, "")), encoding="utf-8")
+        paths[stream] = str(path)
+    return paths
 
 
 def _collection_loss_estimate(errors: list[dict[str, Any]], module_counts: dict[str, int]) -> dict[str, Any]:
@@ -859,18 +1158,33 @@ def _process_pilot_project(args: argparse.Namespace, *, project: dict[str, str],
     ]
     result["fixture_repetition_summary"] = summarize_fixture_repetitions(events)
     result["test_to_fixtures"] = result["execution_runs"][0]["metadata"].get("test_to_fixtures", {})
-    result["pytest_run_classification"] = (
-        "completed_with_test_or_collection_failures"
-        if any(run["run"].get("returncode") == 1 for run in result["execution_runs"])
-        else "completed_without_pytest_failures"
+    collection_error_count = len(result.get("collection_errors", []))
+    result["collection_error_count"] = collection_error_count
+    result["collection_status"] = "collection_with_errors" if collection_error_count else "collection_clean"
+    has_test_failures = any(
+        run["run"].get("returncode") == 1 for run in result["execution_runs"]
     )
-    result["status"] = "pilot_project_complete"
+    if collection_error_count:
+        result["pytest_run_classification"] = "completed_with_collection_errors"
+        result["status"] = "pilot_project_complete_with_collection_errors"
+    elif has_test_failures:
+        result["pytest_run_classification"] = "completed_with_test_failures"
+        result["status"] = "pilot_project_complete_with_test_failures"
+    else:
+        result["pytest_run_classification"] = "completed_without_pytest_failures"
+        result["status"] = "pilot_project_complete"
     return result
 
 
 def summarize_pilot(record: dict[str, Any]) -> dict[str, Any]:
     projects = record.get("projects", [])
-    completed = [row for row in projects if row.get("status") == "pilot_project_complete"]
+    completed = [row for row in projects if row.get("status") in COMPLETED_PROJECT_STATUSES]
+    collection_error_projects = [
+        row for row in completed if row.get("status") == "pilot_project_complete_with_collection_errors"
+    ]
+    test_failure_projects = [
+        row for row in completed if row.get("status") == "pilot_project_complete_with_test_failures"
+    ]
     error_catalog: dict[str, dict[str, Any]] = {}
     setup_discordance = []
     breaker_comparisons = []
@@ -913,11 +1227,16 @@ def summarize_pilot(record: dict[str, Any]) -> dict[str, Any]:
                 for row in projects
             ),
             "pilot_projects_complete": len(completed),
+            "pilot_projects_clean": sum(row.get("status") == "pilot_project_complete" for row in completed),
+            "pilot_projects_with_collection_errors": len(collection_error_projects),
+            "pilot_projects_with_test_failures": len(test_failure_projects),
             "projects_with_python_fallback": sum(
-                len(row.get("python_candidate_attempts", [])) > 1 for row in projects
+                sum(item.get("attempted", True) for item in row.get("python_candidate_attempts", [])) > 1
+                for row in projects
             ),
             "python_candidates_attempted": sum(
-                len(row.get("python_candidate_attempts", [])) for row in projects
+                sum(item.get("attempted", True) for item in row.get("python_candidate_attempts", []))
+                for row in projects
             ),
         },
         "status_counts": {status: statuses.count(status) for status in sorted(set(statuses))},
@@ -966,6 +1285,9 @@ def main() -> int:
     parser.add_argument("--project-id", help="ID de um projeto da amostra; padrão: primeiro")
     parser.add_argument("--pilot", action="store_true",
                         help="executa todos os projetos da amostra (sem esta opção, executa só o primeiro)")
+    parser.add_argument("--resume-existing-progress", action="store_true",
+                        help=("reaproveita resultados terminais do progresso existente se o launcher mudou; "
+                              "use somente com a mesma amostra e os mesmos parâmetros"))
     parser.add_argument("--comparison-projects", type=int, default=6,
                         help="quantidade de projetos iniciais da amostra para comparar setup-only/normal")
     parser.add_argument("--install-smoke-only", action="store_true",
@@ -1037,6 +1359,8 @@ def main() -> int:
         parser.error("timeouts e limite do clone devem ser positivos")
     if args.pilot and args.install_smoke_only:
         parser.error("--pilot e --install-smoke-only são modos distintos")
+    if args.resume_existing_progress and not args.pilot:
+        parser.error("--resume-existing-progress só pode ser usado com --pilot")
     if args.reuse_source and (not args.project_id or args.pilot or args.install_smoke_only):
         parser.error("--reuse-source exige --project-id e não combina com --pilot/--install-smoke-only")
     python_candidates = [value.strip() for value in args.python_candidates.split(",") if value.strip()]
@@ -1100,6 +1424,46 @@ def main() -> int:
             "isolation_launcher": launcher,
             "timeout_per_test": args.timeout_per_test,
         })
+        prior_progress = _read_json(artifacts / "pilot_progress.json") if args.pilot else {}
+        prior_rows = prior_progress.get("projects", [])
+        sample_prefix_matches = (
+            isinstance(prior_rows, list)
+            and len(prior_rows) <= len(projects)
+            and all(
+                isinstance(prior, dict)
+                and prior.get("project_id") == current["project_id"]
+                and prior.get("commit_sha") == current["commit_sha"]
+                for prior, current in zip(prior_rows, projects)
+            )
+        )
+        prior_fingerprint_matches = (
+            prior_progress.get("tooling_fingerprint") == record["tooling_fingerprint"]
+        )
+        prior_sample_matches = prior_progress.get("sample") == str(args.sample.resolve())
+        can_resume_progress = (
+            bool(prior_rows)
+            and sample_prefix_matches
+            and prior_sample_matches
+            and (prior_fingerprint_matches or args.resume_existing_progress)
+        )
+        prior_rows_by_id = {
+            row.get("project_id"): row for row in prior_rows
+            if isinstance(row, dict) and row.get("project_id")
+        } if can_resume_progress else {}
+        if can_resume_progress:
+            record["resumed_from_progress"] = {
+                "path": str(artifacts / "pilot_progress.json"),
+                "prior_tooling_fingerprint": prior_progress.get("tooling_fingerprint"),
+                "prior_fingerprint_matches": prior_fingerprint_matches,
+                "explicit_fingerprint_override": bool(
+                    args.resume_existing_progress and not prior_fingerprint_matches
+                ),
+            }
+
+        def persist_progress() -> None:
+            record["status"] = "pilot_in_progress"
+            _write_json(artifacts / "pilot_progress.json", _progress_manifest(record))
+
         if not args.install_smoke_only:
             _write_json(artifacts / "setup_only_comparison_cohort.json", comparison_record)
         for project in projects:
@@ -1116,14 +1480,25 @@ def main() -> int:
                 repo = args.reuse_source.resolve() if args.reuse_source else project_root / "source"
                 uv_cache_root = args.uv_cache_dir.resolve()
                 project_dir = project_root / "results"
+                prior_row = prior_rows_by_id.get(pid, {})
+                if (prior_row.get("commit_sha") == sha
+                        and prior_row.get("status") in TERMINAL_PILOT_STATUSES):
+                    resumed_row = dict(prior_row)
+                    resumed_row["resumed_from_checkpoint"] = True
+                    if not prior_fingerprint_matches:
+                        resumed_row["resumed_from_prior_tooling_fingerprint"] = prior_progress.get(
+                            "tooling_fingerprint"
+                        )
+                    record["projects"].append(resumed_row)
+                    persist_progress()
+                    continue
                 saved_project = _read_project_checkpoint(project_dir)
-                if (saved_project.get("status") == "pilot_project_complete"
+                if (saved_project.get("status") in TERMINAL_PILOT_STATUSES
                         and saved_project.get("commit_sha") == sha
                         and saved_project.get("tooling_fingerprint") == record["tooling_fingerprint"]):
                     saved_project["resumed_from_checkpoint"] = True
                     record["projects"].append(saved_project)
-                    record["status"] = "pilot_in_progress"
-                    _write_json(artifacts / "pilot_progress.json", _progress_manifest(record))
+                    persist_progress()
                     continue
             project_record: dict[str, Any] = {
                 "project_id": pid, "commit_sha": sha, "url": redact(url),
@@ -1141,6 +1516,7 @@ def main() -> int:
                 project_record["artifact_write_error"] = f"{type(exc).__name__}: {exc}"
                 project_record["status"] = "artifact_directory_not_writable"
                 record["projects"].append(project_record)
+                persist_progress()
                 if args.install_smoke_only:
                     record["status"] = "installation_smoke_failed"
                     report_path = artifacts / f"install_smoke_{pid}.json"
@@ -1149,12 +1525,16 @@ def main() -> int:
                     return 2
                 continue
             if not repo.exists():
-                clone = run(["git", "clone", "--quiet", "--no-tags", url, str(repo)],
+                # Some projects derive their package version from Git tags
+                # (e.g. setuptools-scm); omitting tags can create a false
+                # version such as 0.1.dev and break their declared dev extras.
+                clone = run(["git", "clone", "--quiet", url, str(repo)],
                             cwd=temp_root, env=env, timeout=args.clone_timeout)
                 project_record["clone"] = clone
                 if clone["returncode"] != 0 or clone["timed_out"]:
                     project_record["status"] = "clone_failed"
                     record["projects"].append(project_record)
+                    persist_progress()
                     continue
             else:
                 project_record["clone"] = {
@@ -1167,16 +1547,48 @@ def main() -> int:
             if checkout["returncode"] != 0:
                 project_record["status"] = "checkout_failed"
                 record["projects"].append(project_record)
+                persist_progress()
                 continue
             size = repository_working_tree_bytes(repo)
             project_record["working_tree_bytes"] = size
             if size > args.max_repo_bytes:
                 project_record["status"] = "repo_size_limit_exceeded"
                 record["projects"].append(project_record)
+                persist_progress()
+                continue
+
+            python_requirement, python_requirement_source = project_python_requirement(repo)
+            project_record["python_requirement"] = {
+                "specifier": python_requirement,
+                "source": python_requirement_source,
+            }
+            requested_candidates = [args.python] if args.install_smoke_only else python_candidates
+            compatible_candidates: list[tuple[int, str]] = []
+            skipped_candidates: list[dict[str, Any]] = []
+            for candidate_order, candidate in enumerate(requested_candidates, start=1):
+                compatible = (
+                    python_request_satisfies(candidate, python_requirement)
+                    if python_requirement and not args.install_smoke_only else True
+                )
+                if compatible is False:
+                    skipped_candidates.append({
+                        "candidate_order": candidate_order,
+                        "python_request": candidate,
+                        "attempted": False,
+                        "status": "skipped_python_incompatible",
+                        "skip_reason": f"does not satisfy {python_requirement} from {python_requirement_source}",
+                    })
+                else:
+                    compatible_candidates.append((candidate_order, candidate))
+            if not compatible_candidates:
+                project_record["python_candidate_attempts"] = skipped_candidates
+                project_record["status"] = "no_compatible_python_candidate"
+                record["projects"].append(project_record)
+                persist_progress()
                 continue
 
             ready_python = repo / ".venv_ready" / "bin" / "python"
-            candidate_attempts: list[dict[str, Any]] = []
+            candidate_attempts: list[dict[str, Any]] = list(skipped_candidates)
             if ready_python.is_file():
                 check = run([str(ready_python), "-c", "import pytest; print(pytest.__version__)"],
                             cwd=repo, env=env, timeout=30)
@@ -1189,11 +1601,13 @@ def main() -> int:
                     project_record["status"] = "stale_ready_environment"
                     project_record["dependency_installation"] = installation
                     record["projects"].append(project_record)
+                    persist_progress()
                     continue
                 if args.install_smoke_only:
                     project_record["status"] = "installation_smoke_passed"
                     project_record["dependency_installation"] = installation
                     record["projects"].append(project_record)
+                    persist_progress()
                     continue
                 project_result = _process_pilot_project(
                     args, project=project, repo=repo, python=installation["python"],
@@ -1202,16 +1616,17 @@ def main() -> int:
                     run_prefix="reused",
                 )
                 project_record.update(installation=installation, **project_result)
-                project_record["python_candidate_attempts"] = [{
-                    "candidate": "reused_ready_environment",
+                project_record["python_candidate_attempts"] = sorted(candidate_attempts + [{
+                    "candidate_order": 0,
+                    "python_request": "reused_ready_environment",
+                    "attempted": True,
                     "status": project_result.get("status"),
                     "collection_fraction": project_result.get("collection_fraction"),
-                }]
+                }], key=lambda item: item["candidate_order"])
             else:
-                candidates = [args.python] if args.install_smoke_only else python_candidates
                 project_result = None
                 installation = {"ready": False, "status": "all_python_candidates_failed"}
-                for candidate_index, candidate in enumerate(candidates, start=1):
+                for candidate_index, candidate in compatible_candidates:
                     attempt = install_project_dependencies(
                         repo,
                         project_id=pid,
@@ -1226,6 +1641,7 @@ def main() -> int:
                     candidate_record: dict[str, Any] = {
                         "candidate_order": candidate_index,
                         "python_request": candidate,
+                        "attempted": True,
                         "installation": attempt,
                     }
                     candidate_attempts.append(candidate_record)
@@ -1247,21 +1663,31 @@ def main() -> int:
                     project_result = candidate_result
                     if candidate_result.get("status") == "collection_below_provisional_fraction_threshold":
                         remove_ready_venv(repo, repo / ".venv_ready")
-                        if candidate_index == len(candidates):
+                        attempt["ready"] = False
+                        attempt["status"] = "installed_but_collection_unviable"
+                        attempt["environment_removed"] = True
+                        if candidate_order == compatible_candidates[-1][0]:
                             candidate_result["status"] = "collection_unviable_for_all_python_candidates"
                             project_result = candidate_result
                         continue
                     # Unstable collection or isolation failure is recorded; do not
                     # select a later interpreter based on fixture success.
                     break
-                project_record["python_candidate_attempts"] = candidate_attempts
+                project_record["python_candidate_attempts"] = sorted(
+                    candidate_attempts, key=lambda item: item["candidate_order"]
+                )
 
             project_record["dependency_installation"] = installation
             if not installation.get("ready"):
-                if project_result and project_result.get("status") == "collection_below_provisional_fraction_threshold":
+                if project_result and project_result.get("status") in {
+                    "collection_below_provisional_fraction_threshold",
+                    "collection_unviable_for_all_python_candidates",
+                }:
                     project_result["status"] = "collection_unviable_for_all_python_candidates"
                     project_record.update(project_result)
-                    project_record["python_candidate_attempts"] = candidate_attempts
+                    project_record["python_candidate_attempts"] = sorted(
+                        candidate_attempts, key=lambda item: item["candidate_order"]
+                    )
                     project_record["tooling_fingerprint"] = record["tooling_fingerprint"]
                     compact_project = _compact_project_record(
                         project_record, project_dir / "project_result.json"
@@ -1269,17 +1695,21 @@ def main() -> int:
                     record["projects"].append(compact_project)
                     _write_json(project_dir / "project_result.json", compact_project)
                     _write_json(project_dir / "project_checkpoint.json", compact_project)
+                    persist_progress()
                     continue
                 project_record["status"] = "dependency_unresolvable"
                 record["projects"].append(project_record)
+                persist_progress()
                 continue
             if args.install_smoke_only:
                 project_record["status"] = "installation_smoke_passed"
                 record["projects"].append(project_record)
+                persist_progress()
                 continue
             if project_result is None:
                 project_record["status"] = "collection_unviable_for_all_python_candidates"
                 record["projects"].append(project_record)
+                persist_progress()
                 continue
             project_record.update(project_result)
             project_record["tooling_fingerprint"] = record["tooling_fingerprint"]
@@ -1290,9 +1720,7 @@ def main() -> int:
             _write_json(project_dir / "project_result.json", compact_project)
             _write_json(project_dir / "project_checkpoint.json", compact_project)
             # Checkpoint after every project so an interrupted batch is resumable.
-            record["status"] = "pilot_in_progress"
-            record["projects"][-1] = compact_project
-            _write_json(artifacts / "pilot_progress.json", _progress_manifest(record))
+            persist_progress()
 
         if args.install_smoke_only:
             project_result = record["projects"][0] if record["projects"] else {}
@@ -1301,11 +1729,27 @@ def main() -> int:
             report_path = artifacts / f"install_smoke_{projects[0]['project_id']}.json"
         else:
             statuses = {item.get("status") for item in record["projects"]}
-            record["status"] = (
-                "pilot_complete" if args.pilot and statuses == {"pilot_project_complete"}
-                else "single_project_complete" if not args.pilot and statuses == {"pilot_project_complete"}
-                else "pilot_incomplete"
-            )
+            if statuses and statuses.issubset(TERMINAL_PILOT_STATUSES):
+                if statuses - COMPLETED_PROJECT_STATUSES:
+                    record["status"] = (
+                        "pilot_complete_with_project_losses" if args.pilot
+                        else "single_project_complete_with_project_losses"
+                    )
+                elif statuses == {"pilot_project_complete"}:
+                    record["status"] = "pilot_complete" if args.pilot else "single_project_complete"
+                elif any(item.get("status") == "pilot_project_complete_with_collection_errors"
+                         for item in record["projects"]):
+                    record["status"] = (
+                        "pilot_complete_with_collection_errors" if args.pilot
+                        else "single_project_complete_with_collection_errors"
+                    )
+                else:
+                    record["status"] = (
+                        "pilot_complete_with_test_failures" if args.pilot
+                        else "single_project_complete_with_test_failures"
+                    )
+            else:
+                record["status"] = "pilot_incomplete"
             record["setup_only_comparison_cohort"] = comparison_record
             record["pilot_summary"] = summarize_pilot(record)
             report_path = artifacts / ("pilot_report.json" if args.pilot else "single_project_report.json")
@@ -1321,7 +1765,10 @@ def main() -> int:
         print(f"Relatório salvo em: {report_path}")
     if args.install_smoke_only:
         return 0 if passed else 2
-    return 0 if record.get("status") in {"pilot_complete", "single_project_complete"} else 2
+    return 0 if record.get("status") in {
+        "pilot_complete", "single_project_complete",
+        "pilot_complete_with_project_losses", "single_project_complete_with_project_losses",
+    } else 2
 
 
 if __name__ == "__main__":

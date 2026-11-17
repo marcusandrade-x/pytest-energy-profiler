@@ -72,17 +72,21 @@ auditoria ficam em `../data/pilot/pilot_sample.csv` e
 
 - Catálogo estático: concluído para 417 projetos elegíveis; 86.647 definições
   de fixture registradas.
-- Amostra: gerada e validada estruturalmente — 30 IDs distintos, SHAs válidos e
-  consistentes com auditoria/catálogo, quartis 8/8/7/7.
+- Amostra piloto: 30 IDs distintos, SHAs válidos e consistentes com
+  auditoria/catálogo, quartis 8/8/7/7. Varredura completa preparada em
+  `../data/pilot/full_417_sample.csv` e auditada em
+  `../data/pilot/full_417_sample_audit.csv` (417 projetos; quartis 105/104/104/104).
 - Isolamento: os três controles foram aprovados no preflight executado em
   13/11/2026. Revalidar após mudanças no host antes da próxima execução.
-- Piloto: iniciado e interrompido antes de consolidar os 30 projetos. Os
-  artefatos parciais estão em `/var/tmp/phase1-artifacts-997/`; a leitura
-  preliminar está em [`PARTIAL_PILOT_ANALYSIS.md`](PARTIAL_PILOT_ANALYSIS.md).
-- Validade do piloto: seis projetos têm duas execuções completas utilizáveis;
-  `deepeval` expirou, `pytorch-image-models` sofreu OOM e `OpenSRE` teve falha
-  do probe ao resolver caminhos. O status legado de completo não é aceito
-  nesses três casos.
+- Piloto dinâmico n=30: relatório final `pilot_incomplete`, com todos os IDs
+  registrados e 14 projetos com duas execuções completas. Artefatos em
+  `/var/tmp/phase1-standardized-pilot-20261116-b39a78c/artifacts/`.
+- Regra N/U escolhida para v2: `K=3`, `p=0,90`,
+  `U >= min(N, max(K, ceil(p*N)))`; no piloto, 13/14 projetos analisáveis
+  passaram. A fração mínima de coleta dinâmica também foi fixada em 0,50.
+- Sentry avançou com Python 3.13 até a coleta, mas exige Redis em
+  `localhost:6379`. Por decisão operacional, serviços externos não serão
+  provisionados; classificar esse tipo de bloqueio separadamente.
 - Correções locais não commitadas: controle de códigos de saída e timeout,
   saída de subprocesso limitada, checkpoints compactos/atômicos, expansão
   AST de parametrizações literais e uso de `PosixPath` no probe.
@@ -91,7 +95,13 @@ auditoria ficam em `../data/pilot/pilot_sample.csv` e
 - Conferência de `SuperClaude_Framework`: preparada, mas não iniciada pelo
   executor nesta sessão porque `sudo -u phase1runner` requer autenticação em
   terminal interativo. Rodar manualmente no terminal do responsável.
-- Pré-registro v2, congelamento final do tooling e conclusão do piloto:
-  pendentes. Não iniciar a varredura completa nem as medições de energia antes
-  desses marcos.
+- Pré-registro v2 preparado em `PREREGISTRATION_V2.md`, ainda não versionado.
+  A triagem dos 417 não deve começar até congelar essa versão e validar a cópia
+  do launcher atualizado no host remoto. As mudanças atuais do launcher foram
+  feitas localmente e ainda não foram validadas no host remoto.
+- Varredura dos 417: amostra gerada, execução pendente. Limiar X de perda será
+  escolhido após a triagem, conforme o pré-registro v1, antes das medições de
+  energia.
+- RQ2: medições de energia ainda não realizadas. Lotes, repetições,
+  estabilidade e calibração do backend permanecem pendentes antes dessa etapa.
 - RQ2: medições de energia ainda não realizadas.
