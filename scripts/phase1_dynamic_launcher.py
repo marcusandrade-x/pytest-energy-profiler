@@ -338,6 +338,30 @@ def remove_ready_venv(repo: Path, ready: Path) -> None:
         shutil.rmtree(ready)
 
 
+def discard_project_workspace(
+    artifacts: Path, uv_cache_root: Path, project_id: str, commit_sha: str,
+) -> None:
+    """Remove only this project's generated checkout and cache after checkpointing."""
+    project_root = artifacts.resolve() / "pilot" / project_id / commit_sha
+    source = project_root / "source"
+    if source.is_symlink():
+        raise ValueError(f"recusa de remover checkout por symlink: {source}")
+    if source.exists():
+        if source.parent.resolve() != project_root.resolve() or source.name != "source":
+            raise ValueError(f"recusa de remover checkout inesperado: {source}")
+        shutil.rmtree(source)
+
+    cache_root = uv_cache_root.resolve()
+    if cache_root.exists():
+        for cache in cache_root.iterdir():
+            if not re.fullmatch(re.escape(project_id) + r"-\d+", cache.name):
+                continue
+            if cache.is_symlink() or cache.is_file():
+                cache.unlink()
+            elif cache.is_dir():
+                shutil.rmtree(cache)
+
+
 def repository_working_tree_bytes(repo: Path) -> int:
     """Count source checkout size without VCS metadata or generated virtualenvs."""
     total = 0
@@ -1294,6 +1318,11 @@ def main() -> int:
                         help="instala somente o projeto selecionado e preserva clone/.venv_ready")
     parser.add_argument("--reuse-source", type=Path,
                         help="reutiliza um clone existente com .venv_ready; exige --project-id e SHA idêntico")
+    parser.add_argument(
+        "--discard-project-workspace-after-checkpoint", action="store_true",
+        help=("após salvar cada projeto, remove seu clone, ambientes virtuais e cache uv; "
+              "os resultados persistidos permanecem e a fase de energia deverá reinstalar os projetos selecionados"),
+    )
     parser.add_argument("--isolation-launcher-json")
     parser.add_argument("--python", default=sys.executable,
                         help="Python base; padrão: interpretador que executa este launcher")
@@ -1316,7 +1345,7 @@ def main() -> int:
                         help="Destino persistente para Pythons gerenciados pelo uv")
     parser.add_argument("--timeout-per-test", type=int, default=120)
     parser.add_argument("--collection-min-fraction", type=float, default=0.5,
-                        help="limiar provisório de viabilidade para o piloto; será congelado na v2")
+                        help="limiar mínimo de coleta dinâmica definido no pré-registro v2")
     parser.add_argument("--clone-timeout", type=int, default=600)
     parser.add_argument("--install-timeout", type=int, default=1200,
                         help="limite por tentativa de dependências; padrão do pré-registro: 20 minutos")
@@ -1363,6 +1392,13 @@ def main() -> int:
         parser.error("--resume-existing-progress só pode ser usado com --pilot")
     if args.reuse_source and (not args.project_id or args.pilot or args.install_smoke_only):
         parser.error("--reuse-source exige --project-id e não combina com --pilot/--install-smoke-only")
+    if args.discard_project_workspace_after_checkpoint and (
+        not args.pilot or args.install_smoke_only or args.reuse_source
+    ):
+        parser.error(
+            "--discard-project-workspace-after-checkpoint exige --pilot e não combina "
+            "com --install-smoke-only/--reuse-source"
+        )
     python_candidates = [value.strip() for value in args.python_candidates.split(",") if value.strip()]
     if not python_candidates or len(python_candidates) > 3 or len(set(python_candidates)) != len(python_candidates):
         parser.error("--python-candidates deve listar de uma a três versões únicas")
@@ -1420,6 +1456,7 @@ def main() -> int:
             "sample_sha256": __import__("hashlib").sha256(sample_bytes).hexdigest(),
             "python_candidates": python_candidates,
             "collection_min_fraction": args.collection_min_fraction,
+            "discard_project_workspace_after_checkpoint": args.discard_project_workspace_after_checkpoint,
             "comparison_project_ids": comparison_record["project_ids"],
             "isolation_launcher": launcher,
             "timeout_per_test": args.timeout_per_test,
@@ -1463,6 +1500,14 @@ def main() -> int:
         def persist_progress() -> None:
             record["status"] = "pilot_in_progress"
             _write_json(artifacts / "pilot_progress.json", _progress_manifest(record))
+            if args.discard_project_workspace_after_checkpoint and record["projects"]:
+                completed = record["projects"][-1]
+                project_id = completed.get("project_id")
+                commit_sha = completed.get("commit_sha")
+                if project_id and commit_sha:
+                    discard_project_workspace(
+                        artifacts, args.uv_cache_dir, project_id, commit_sha,
+                    )
 
         if not args.install_smoke_only:
             _write_json(artifacts / "setup_only_comparison_cohort.json", comparison_record)

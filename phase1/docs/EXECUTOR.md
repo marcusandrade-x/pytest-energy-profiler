@@ -58,6 +58,18 @@ O relatório final agrega o funil, erros, discordância de `--setup-only` e a
 comparação K=3. O piloto não calcula X nem define o mínimo de fixtures; ambos
 continuam reservados às regras já registradas.
 
+## Varredura completa e retenção de espaço
+
+A amostra integral fica em `phase1/data/pilot/full_417_sample.csv`; sua auditoria
+acompanha o CSV. Para hosts com espaço limitado, use
+`--discard-project-workspace-after-checkpoint` junto de `--pilot`. Depois de
+salvar o checkpoint e os resultados de cada projeto, o launcher remove o clone,
+ambientes virtuais e cache `uv` daquele projeto. Os JSONs, mapas, inventário
+estático, tentativas de instalação e resumo de pacotes permanecem em
+`artifacts/pilot/ID/SHA/results/`. A etapa de energia deverá clonar e reinstalar
+somente os projetos selecionados. Não use essa opção com `--reuse-source` ou
+`--install-smoke-only`.
+
 ## Aceite antes dos 30
 
 - Depois de atualizar o código, instale também a versão atualizada do helper
