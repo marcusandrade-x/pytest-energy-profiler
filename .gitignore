@@ -31,6 +31,9 @@ repositorios_temp/
 results/
 output/
 out/
+/input_data/mined_projects_v2.csv
+/input_data/mined_projects_v2_provenance.csv
+/workspace/analyzer_v2/
 
 # ==========================================
 # Logs e Varreduras

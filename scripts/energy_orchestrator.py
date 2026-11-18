@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Orquestrador de medição de energia de suítes pytest (clone -> venv -> baseline -> profiler).
+"""Orquestrador de medição de energia de suítes pytest (Analyzer V2 -> clone -> baseline -> profiler).
 
-Lê o CSV do minerador (`input_data/mined_projects.csv` por padrão), pega os candidatos elegíveis
+Lê o inventário do Analyzer V2 (`input_data/mined_projects_v2.csv` por padrão), pega os candidatos elegíveis
 (`motivo_exclusao` vazio) e, para cada um, automatiza:
 
     clone (commit fixado) -> venv + instalação -> baseline -> N medições com o profiler
@@ -80,7 +80,7 @@ Comandos
 
 Exemplo
 -------
-    python energy_orchestrator.py rodar --resultados input_data/mined_projects.csv \\
+    python energy_orchestrator.py rodar --resultados input_data/mined_projects_v2.csv \\
         --lote 20 --jobs 3 --reps 3 --pais BRA
 """
 
@@ -471,6 +471,22 @@ def create_manifest(cfg: argparse.Namespace) -> list[dict[str, str]]:
 
     with cfg.resultados.open(encoding="utf-8") as handle:
         rows = [r for r in csv.DictReader(handle) if not (r.get("motivo_exclusao") or "").strip()]
+
+    provenance_path = cfg.provenance
+    is_v2 = cfg.resultados.name == "mined_projects_v2.csv"
+    if provenance_path is None and is_v2:
+        provenance_path = cfg.resultados.with_name("mined_projects_v2_provenance.csv")
+    if is_v2:
+        if provenance_path is None or not provenance_path.exists():
+            raise SystemExit("Analyzer V2 exige mined_projects_v2_provenance.csv ao lado do inventário (ou --provenance).")
+        with provenance_path.open(encoding="utf-8") as handle:
+            provenance_rows = list(csv.DictReader(handle))
+        sha_by_url = {row.get("url", ""): row.get("commit_sha", "") for row in provenance_rows}
+        missing = [row.get("url", "") for row in rows if not sha_by_url.get(row.get("url", ""))]
+        if missing:
+            raise SystemExit(f"Proveniência V2 sem commit_sha para {len(missing)} projeto(s); não é seguro medir outra revisão.")
+        for row in rows:
+            row[cfg.coluna_commit] = sha_by_url[row.get("url", "")]
 
     def num(row: dict[str, str], key: str) -> float:
         return safe_float(row.get(key), 0.0)
@@ -984,7 +1000,7 @@ def stage_baseline(p: Proj, st: dict[str, Any], cfg: argparse.Namespace, ov: dic
         bad = counts["failures"] + counts["errors"]
         miner_tests = safe_float(p.row.get("num_tests"))
         if miner_tests > 0:  # contagem estática do minerador vs. coletada pelo pytest
-            info["collected_over_static_tests"] = round(tests / miner_tests, 3)
+            info["baseline_over_input_num_tests"] = round(tests / miner_tests, 3)
         if res.returncode == 5 or tests == 0:
             category = "baseline_no_tests"
         elif tests < cfg.min_tests_baseline:
@@ -1372,14 +1388,21 @@ RUN_FIELDS = [
     "test_phase_pearson", "warnings_count", "degraded_features", "config_risk_flags",
     "cpu_model", "cpu_governor", "python_version",
     "pytest_version", "codecarbon_version", "project_git_commit", "freeze_sha1",
-    "profiler_sha1", "message",
+    "profiler_sha1", "input_num_fixtures", "registered_project_fixtures",
+    "activated_project_fixtures", "project_fixtures_with_ok_measurement",
+    "fixture_registry_delta", "registered_fixture_coverage_pct",
+    "activated_fixture_coverage_pct", "measured_fixture_coverage_pct", "message",
 ]
 
 STATUS_FIELDS = [
     "project_id", "url", "final", "completeness", "failure_stage", "failure_category",
     "failure_hint", "failure_message", "commit", "commit_source", "num_tests", "num_fixtures",
     "loc_projeto_total", "baseline_tests", "baseline_failures", "baseline_errors",
-    "baseline_skipped", "baseline_seconds", "collected_over_static_tests",
+    "baseline_skipped", "baseline_seconds", "baseline_over_input_num_tests",
+    "input_num_fixtures", "registered_project_fixtures", "activated_project_fixtures",
+    "project_fixtures_with_ok_measurement", "fixture_registry_delta",
+    "registered_fixture_coverage_pct", "activated_fixture_coverage_pct",
+    "measured_fixture_coverage_pct",
     "reps_planned", "reps_ok", "reps_usable", "reps_discarded",
     "python_version", "pytest_version", "codecarbon_version", "freeze_sha1",
 ]
@@ -1427,6 +1450,7 @@ def build_run_row(p: Proj, st: dict[str, Any], rep: int) -> dict[str, Any]:
         "profiler_sha1": info.get("profiler_sha1"), "message": (info.get("message") or "")[:300],
         "project_git_commit": info.get("commit"), "cpu_mode": info.get("cpu_mode"),
         "unattributed_share": info.get("unattributed_share"),
+        "input_num_fixtures": p.row.get("num_fixtures"),
     }
     rundir = p.runs / f"rep{rep}"
     meta_path = rundir / "fixture_energy_run_metadata.json"
@@ -1440,6 +1464,21 @@ def build_run_row(p: Proj, st: dict[str, Any], rep: int) -> dict[str, Any]:
     fixture_diag, phase_diag = diagnostics.get("fixture", {}), diagnostics.get("test_phase", {})
     env = meta.get("environment", {})
     accounting = meta.get("energy_accounting", {})
+    inventory = meta.get("fixture_inventory", {})
+    input_fixture_count = safe_float(p.row.get("num_fixtures"), 0.0)
+    registered = inventory.get("registered_project_fixture_definitions")
+    activated = inventory.get("activated_project_fixture_definitions")
+    with_ok = inventory.get("project_fixture_definitions_with_ok_measurement")
+    row.update({
+        "input_num_fixtures": input_fixture_count,
+        "registered_project_fixtures": registered,
+        "activated_project_fixtures": activated,
+        "project_fixtures_with_ok_measurement": with_ok,
+        "fixture_registry_delta": registered - input_fixture_count if registered is not None else "",
+        "registered_fixture_coverage_pct": round(100 * registered / input_fixture_count, 2) if registered is not None and input_fixture_count else "",
+        "activated_fixture_coverage_pct": round(100 * activated / input_fixture_count, 2) if activated is not None and input_fixture_count else "",
+        "measured_fixture_coverage_pct": round(100 * with_ok / input_fixture_count, 2) if with_ok is not None and input_fixture_count else "",
+    })
     warmup = safe_float((meta.get("run_info") or {}).get("warmup_seconds"))
     rq1 = _read_rq1(rundir / "fixture_energy_rq1_summary.csv")
 
@@ -1487,6 +1526,19 @@ def build_status_row(p: Proj, st: dict[str, Any]) -> dict[str, Any]:
     reps = st.get("reps", {})
     ok = sum(1 for v in reps.values() if v["status"] in OK_REP_STATUSES)
     usable = sum(1 for v in reps.values() if rep_usable(v))
+    inventory: dict[str, Any] = {}
+    for rep in sorted((int(key) for key in reps), reverse=True):
+        metadata_path = p.runs / f"rep{rep}" / "fixture_energy_run_metadata.json"
+        if metadata_path.exists():
+            try:
+                inventory = json.loads(metadata_path.read_text(encoding="utf-8")).get("fixture_inventory", {})
+                break
+            except (OSError, json.JSONDecodeError):
+                continue
+    input_fixtures = safe_float(p.row.get("num_fixtures"), 0.0)
+    registered = inventory.get("registered_project_fixture_definitions")
+    activated = inventory.get("activated_project_fixture_definitions")
+    measured = inventory.get("project_fixture_definitions_with_ok_measurement")
     return {
         "project_id": p.id, "url": st["url"], "final": st["final"],
         "completeness": st.get("completeness"),
@@ -1496,10 +1548,19 @@ def build_status_row(p: Proj, st: dict[str, Any]) -> dict[str, Any]:
         "commit": st.get("commit"), "commit_source": st.get("commit_source"),
         "num_tests": p.row.get("num_tests"),
         "num_fixtures": p.row.get("num_fixtures"), "loc_projeto_total": p.row.get("loc_projeto_total"),
+        "input_num_fixtures": p.row.get("num_fixtures"),
+        "registered_project_fixtures": registered,
+        "activated_project_fixtures": activated,
+        "project_fixtures_with_ok_measurement": measured,
+        "fixture_registry_delta": registered - input_fixtures if registered is not None else "",
+        "registered_fixture_coverage_pct": round(100 * registered / input_fixtures, 2) if registered is not None and input_fixtures else "",
+        "activated_fixture_coverage_pct": round(100 * activated / input_fixtures, 2) if activated is not None and input_fixtures else "",
+        "measured_fixture_coverage_pct": round(100 * measured / input_fixtures, 2) if measured is not None and input_fixtures else "",
         "baseline_tests": baseline.get("tests"), "baseline_failures": baseline.get("failures"),
         "baseline_errors": baseline.get("errors"), "baseline_skipped": baseline.get("skipped"),
         "baseline_seconds": baseline.get("seconds"),
-        "collected_over_static_tests": baseline.get("collected_over_static_tests"),
+        "baseline_over_input_num_tests": baseline.get("baseline_over_input_num_tests"),
+        "input_num_fixtures": p.row.get("num_fixtures"),
         "reps_planned": st.get("reps_planned"), "reps_ok": ok, "reps_usable": usable,
         "reps_discarded": len(reps) - usable,
         "python_version": install.get("python"), "pytest_version": install.get("pytest"),
@@ -1703,8 +1764,10 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--workspace", type=Path, default=Path("workspace"))
     common.add_argument("--resultados", type=Path,
-                        default=PROJECT_ROOT / "input_data" / "mined_projects.csv",
-                        help="CSV gerado pelo minerador (usa linhas com motivo_exclusao vazio).")
+                        default=PROJECT_ROOT / "input_data" / "mined_projects_v2.csv",
+                        help="Inventário independente do Analyzer V2 (linhas sem motivo_exclusao).")
+    common.add_argument("--provenance", type=Path,
+                        help="Proveniência do Analyzer V2; por padrão, mined_projects_v2_provenance.csv adjacente.")
     common.add_argument("--coluna-commit", default="commit_sha",
                         help="Coluna do CSV do minerador com o SHA analisado (fixa o commit do clone).")
     common.add_argument("--profiler", type=Path,
