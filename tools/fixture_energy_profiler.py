@@ -94,7 +94,7 @@ except ImportError as exc:  # pragma: no cover - startup guard
     ) from exc
 
 
-SCHEMA_VERSION = "v1.1"
+SCHEMA_VERSION = "v1.2"
 
 # Tests with these final outcomes did not really execute the code under test,
 # so their energy is left out of the derived summaries (raw CSV keeps them).
@@ -1000,6 +1000,9 @@ class FixtureEnergyPlugin(OutcomeTracker):
         self.active_fixture_instances: dict[int, str] = {}
         self.instance_tests: dict[str, set[int]] = {}
         self._instance_counter = 0
+        self.registered_project_fixture_ids: set[str] = set()
+        self.activated_project_fixture_ids: set[str] = set()
+        self.project_fixture_ids_with_ok_measurement: set[str] = set()
 
         # Test bookkeeping.
         self.test_index: dict[str, int] = {}
@@ -1083,6 +1086,12 @@ class FixtureEnergyPlugin(OutcomeTracker):
         except ValueError:
             return False
         if any(part in ("site-packages", "dist-packages") for part in source_path.parts):
+            return False
+        ignored_env_parts = ("venv", ".tox")
+        if any(
+            part in ignored_env_parts or part.startswith(".venv")
+            for part in source_path.relative_to(self.project_root).parts
+        ):
             return False
         if self._venv_prefix is not None:
             try:
@@ -1202,6 +1211,9 @@ class FixtureEnergyPlugin(OutcomeTracker):
         self.rows_total += 1
         self.status_counts[row["measurement_status"]] += 1
         self.raw_energy_total += _safe_number(row["energy_consumed_kwh"])
+        if (row.get("record_type") == "fixture" and row.get("is_project_fixture")
+                and row.get("measurement_status") == "ok"):
+            self.project_fixture_ids_with_ok_measurement.add(row["fixture_definition_id"])
 
         if not self.include_all_outcomes and self._is_excluded_row(row):
             self.rows_excluded += 1
@@ -1323,7 +1335,9 @@ class FixtureEnergyPlugin(OutcomeTracker):
             fixture_manager = session._fixturemanager
             for definitions in fixture_manager._arg2fixturedefs.values():
                 for fixturedef in definitions:
-                    self._static_info(fixturedef)
+                    info = self._static_info(fixturedef)
+                    if info.is_project:
+                        self.registered_project_fixture_ids.add(info.definition_id)
         except Exception as exc:
             self._warn_once(
                 "precompute",
@@ -1370,6 +1384,8 @@ class FixtureEnergyPlugin(OutcomeTracker):
         if self.project_only and not info.is_project:
             yield
             return
+        if info.is_project:
+            self.activated_project_fixture_ids.add(info.definition_id)
 
         # Every actual fixture initialization gets its own instance ID. A
         # session-scoped fixture therefore gets one, a function-scoped fixture
@@ -1715,6 +1731,11 @@ class FixtureEnergyPlugin(OutcomeTracker):
             "tests": {
                 "total": len(self.test_index),
                 "outcome_counts": dict(self.outcome_counts),
+            },
+            "fixture_inventory": {
+                "registered_project_fixture_definitions": len(self.registered_project_fixture_ids),
+                "activated_project_fixture_definitions": len(self.activated_project_fixture_ids),
+                "project_fixture_definitions_with_ok_measurement": len(self.project_fixture_ids_with_ok_measurement),
             },
             "measurements": {
                 "rows_total": self.rows_total,
